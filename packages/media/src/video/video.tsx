@@ -1,13 +1,13 @@
 import React, {useMemo, useState} from 'react';
 import {
 	Freeze,
-	Internals,
 	Interactive,
+	Internals,
 	Sequence,
 	useRemotionEnvironment,
 	useVideoConfig,
-	type SequenceControls,
 	type InteractivitySchema,
+	type SequenceControls,
 } from 'remotion';
 import {getLoopDisplay} from '../show-in-timeline';
 import {validateToneFrequency} from '../validate-tone-frequency';
@@ -101,6 +101,7 @@ const InnerVideo: React.FC<
 	onError,
 	credentials,
 	requestInit,
+	pauseWhenBuffering,
 	controls,
 	objectFit,
 	_experimentalInitiallyDrawCachedFrame,
@@ -200,6 +201,7 @@ const InnerVideo: React.FC<
 			onError={onError}
 			credentials={credentials}
 			requestInit={requestInit}
+			pauseWhenBuffering={pauseWhenBuffering}
 			controls={controls}
 			objectFit={objectFit}
 			effects={effects}
@@ -241,6 +243,7 @@ const VideoInner: React.FC<
 	onError,
 	credentials,
 	requestInit,
+	pauseWhenBuffering,
 	controls,
 	objectFit,
 	_experimentalInitiallyDrawCachedFrame,
@@ -423,6 +426,7 @@ const VideoInner: React.FC<
 					onError={onError}
 					credentials={credentials}
 					requestInit={requestInit}
+					pauseWhenBuffering={pauseWhenBuffering ?? true}
 					controls={controls}
 					objectFit={objectFit ?? 'contain'}
 					_experimentalInitiallyDrawCachedFrame={

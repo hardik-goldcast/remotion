@@ -212,6 +212,7 @@ const AudioForPreviewAssertedShowing: React.FC<NewAudioForPreviewProps> = ({
 				credentials,
 				requestInit: initialRequestInit,
 				tagType: 'audio',
+				bufferingLabel: 'AudioForPreview',
 				getEffects: () => [],
 				getEffectChainState: () => null,
 			});

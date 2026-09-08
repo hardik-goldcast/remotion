@@ -11,7 +11,17 @@ export const experimental_Audio = Audio;
  */
 export const experimental_Video = Video;
 
+export {
+	DEFAULT_AUDIO_FEED_SCHEDULER_CONFIG,
+	resolveAudioFeedSchedulerConfig,
+} from './audio-scheduler/audio-feed-scheduler-config';
 export type {
+	AudioFeedSchedulerConfig,
+	AudioFeedSchedulerConfigOverrides,
+} from './audio-scheduler/audio-feed-scheduler-config';
+export type {
+	AudioFeedPlan,
+	AudioFeedRange,
 	AudioScheduleEntry,
 	AudioSchedulerProps,
 	AudioSchedulerSource,

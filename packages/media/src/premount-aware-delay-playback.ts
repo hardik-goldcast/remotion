@@ -1,5 +1,8 @@
 import type {useBufferState} from 'remotion';
-import type {DelayPlaybackIfNotPremounting} from './delay-playback-if-not-premounting';
+import type {
+	DelayPlaybackIfNotPremounting,
+	DelayPlaybackMetadata,
+} from './delay-playback-if-not-premounting';
 
 type TrackedDelayHandle = {
 	arm: () => void;
@@ -14,19 +17,23 @@ export class PremountAwareDelayPlayback {
 	private readonly delayPlayback: ReturnType<
 		typeof useBufferState
 	>['delayPlayback'];
+	private readonly baseMetadata: DelayPlaybackMetadata;
 
 	constructor({
 		bufferState,
 		isPremounting,
 		isPostmounting,
+		baseMetadata = {},
 	}: {
 		bufferState: ReturnType<typeof useBufferState>;
 		isPremounting: boolean;
 		isPostmounting: boolean;
+		baseMetadata?: DelayPlaybackMetadata;
 	}) {
 		this.delayPlayback = bufferState.delayPlayback;
 		this.isPremounting = isPremounting;
 		this.isPostmounting = isPostmounting;
+		this.baseMetadata = baseMetadata;
 	}
 
 	private shouldDelayPlayback(): boolean {
@@ -53,17 +60,23 @@ export class PremountAwareDelayPlayback {
 		this.syncHandles();
 	}
 
-	public createHandle(): DelayPlaybackIfNotPremounting {
+	public createHandle(
+		metadata?: DelayPlaybackMetadata,
+	): DelayPlaybackIfNotPremounting {
 		let armed = false;
 		let unblock: (() => void) | null = null;
 		let disposed = false;
+		const resolvedMetadata = {
+			...this.baseMetadata,
+			...(metadata ?? {}),
+		};
 
 		const arm = () => {
 			if (armed || disposed) {
 				return;
 			}
 
-			unblock = this.delayPlayback().unblock;
+			unblock = this.delayPlayback(resolvedMetadata).unblock;
 			armed = true;
 		};
 

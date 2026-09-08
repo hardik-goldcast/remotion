@@ -18,8 +18,8 @@ import {makeSharedElementSourceNode} from './shared-element-source-node.js';
 import type {RemotionAudioContextState} from './use-audio-context.js';
 import {useSingletonAudioContext} from './use-audio-context.js';
 import {
-	type AudioContextResumeResult,
 	waitUntilActuallyResumed,
+	type AudioContextResumeResult,
 } from './wait-until-actually-resumed.js';
 
 /**
@@ -96,6 +96,12 @@ type SharedAudioContextValue = {
 	resume: () => Promise<void>;
 	resumeAsAutoPlay: () => Promise<void>;
 	suspend: () => Promise<void>;
+	/**
+	 * Suspend the native context while a media pipeline refills. Unlike the
+	 * keep-alive pause path, this preserves the AudioContext clock and queued
+	 * source timestamps instead of muting through the master gain.
+	 */
+	suspendForBuffering: () => Promise<void>;
 	getIsResumingAudioContext: () => Promise<AudioContextResumeResult> | null;
 	unscheduleAudioNode: (node: AudioBufferSourceNode) => void;
 	_experimentalKeepAudioContextAlive: boolean;
@@ -257,6 +263,7 @@ export const SharedAudioContextProvider: React.FC<{
 	const audioContextIsPlayingEventually = useRef(false);
 	const resumeGainRampPending = useRef(false);
 	const resumeAwaitingAnchor = useRef(false);
+	const nativeContextSuspendedForBuffering = useRef(false);
 	const hasStartedPlayback = useRef(false);
 	const initialExperimentalKeepAudioContextAlive = useRef(
 		_experimentalKeepAudioContextAlive,
@@ -454,6 +461,8 @@ export const SharedAudioContextProvider: React.FC<{
 			return Promise.resolve();
 		}
 
+		nativeContextSuspendedForBuffering.current = false;
+
 		if (audioContextIsPlayingEventually.current) {
 			return Promise.resolve();
 		}
@@ -551,6 +560,7 @@ export const SharedAudioContextProvider: React.FC<{
 
 	const suspend = useCallback(() => {
 		isResuming.current?.abortController.abort();
+		nativeContextSuspendedForBuffering.current = false;
 
 		if (!ctxAndGain) {
 			return Promise.resolve();
@@ -582,6 +592,38 @@ export const SharedAudioContextProvider: React.FC<{
 		return ctxAndGain.suspend();
 	}, [ctxAndGain, _experimentalKeepAudioContextAlive]);
 
+	const suspendForBuffering = useCallback(() => {
+		isResuming.current?.abortController.abort();
+
+		if (!ctxAndGain) {
+			return Promise.resolve();
+		}
+
+		// Set this before checking the logical playback flag. In keep-alive mode the
+		// native context can already be running while playback's first resume() is
+		// still queued; buffering must stop that clock even in that initial order.
+		nativeContextSuspendedForBuffering.current = true;
+
+		// Buffering is different from an ordinary keep-alive pause: the decoder is
+		// allowed to refill the queue, so the native clock must stop advancing while
+		// those source timestamps remain valid. resume() will start any nodes queued
+		// while the context is suspended before resuming the context.
+		audioContextIsPlayingEventually.current = false;
+		resumeGainRampPending.current = false;
+		resumeAwaitingAnchor.current = false;
+		const state = ctxAndGain.getState();
+		if (
+			state === 'closed' ||
+			state === 'interrupted' ||
+			state === 'suspended' ||
+			state === 'running-to-suspended'
+		) {
+			return Promise.resolve();
+		}
+
+		return ctxAndGain.suspend();
+	}, [ctxAndGain]);
+
 	// With _experimentalKeepAudioContextAlive, start the context as early as
 	// possible so the first play never waits on the suspended→running transition. Where
 	// no autoplay restriction applies (e.g. Electron with
@@ -604,6 +646,10 @@ export const SharedAudioContextProvider: React.FC<{
 		}
 
 		const wake = () => {
+			if (nativeContextSuspendedForBuffering.current) {
+				return;
+			}
+
 			if (ctxAndGain.audioContext.state === 'running') {
 				return;
 			}
@@ -639,6 +685,7 @@ export const SharedAudioContextProvider: React.FC<{
 			resume,
 			resumeAsAutoPlay,
 			suspend,
+			suspendForBuffering,
 			getIsResumingAudioContext,
 			unscheduleAudioNode,
 			_experimentalKeepAudioContextAlive,
@@ -651,6 +698,7 @@ export const SharedAudioContextProvider: React.FC<{
 		resume,
 		resumeAsAutoPlay,
 		suspend,
+		suspendForBuffering,
 		getIsResumingAudioContext,
 		unscheduleAudioNode,
 		_experimentalKeepAudioContextAlive,

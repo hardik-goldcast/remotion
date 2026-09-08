@@ -75,6 +75,7 @@ type VideoForPreviewProps = NativeVideoProps & {
 	readonly credentials: RequestCredentials | undefined;
 	readonly requestInit: MediaRequestInit | undefined;
 	readonly objectFit: VideoObjectFit;
+	readonly pauseWhenBuffering: boolean | undefined;
 	readonly setMediaDurationInSeconds: (durationInSeconds: number) => void;
 	readonly _experimentalInitiallyDrawCachedFrame: boolean;
 	readonly effects: EffectDefinitionAndStack<unknown>[];
@@ -82,6 +83,14 @@ type VideoForPreviewProps = NativeVideoProps & {
 };
 
 type VideoForPreviewAssertedShowingProps = VideoForPreviewProps;
+
+// When pauseWhenBuffering is explicitly false, video readiness is best-effort:
+// the player can decode and paint whenever it can without acquiring a shared
+// Remotion buffering block. The normal preview path passes true for visual
+// video, so it participates in two-way buffering.
+const NO_OP_VIDEO_BUFFER_STATE = {
+	delayPlayback: () => ({unblock: () => undefined}),
+};
 
 const VideoForPreviewAssertedShowing: React.FC<
 	VideoForPreviewAssertedShowingProps
@@ -106,6 +115,7 @@ const VideoForPreviewAssertedShowing: React.FC<
 	audioStreamIndex,
 	debugOverlay,
 	headless,
+	pauseWhenBuffering,
 	onError,
 	credentials,
 	requestInit,
@@ -281,7 +291,10 @@ const VideoForPreviewAssertedShowing: React.FC<
 				toneFrequency: initialToneFrequency.current,
 				audioStreamIndex,
 				debugOverlay,
-				bufferState: buffer,
+				bufferState:
+					pauseWhenBuffering === false
+						? NO_OP_VIDEO_BUFFER_STATE
+						: buffer,
 				isPremounting: initialIsPremounting.current,
 				isPostmounting: initialIsPostmounting.current,
 				globalPlaybackRate: initialGlobalPlaybackRate.current,
@@ -292,7 +305,8 @@ const VideoForPreviewAssertedShowing: React.FC<
 				credentials,
 				requestInit: initialRequestInit,
 				tagType: 'video',
-				requireCanvasForVideo: !headless,
+				bufferingLabel: 'VideoForPreview',
+				requireCanvasForVideo: !headless && pauseWhenBuffering !== false,
 				getEffects: () => effectsRef.current,
 				getEffectChainState: (width, height) =>
 					effectChainStateRef.current?.get(width, height)!,
@@ -449,6 +463,7 @@ const VideoForPreviewAssertedShowing: React.FC<
 		videoConfig.fps,
 		credentials,
 		initialRequestInit,
+		pauseWhenBuffering,
 		setMediaDurationInSeconds,
 	]);
 

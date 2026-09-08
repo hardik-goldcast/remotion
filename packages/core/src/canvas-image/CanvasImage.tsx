@@ -297,14 +297,20 @@ const CanvasImageContent = forwardRef<
 				return;
 			}
 
-			return delayPlayback().unblock;
+			return delayPlayback({
+				label: 'image-load',
+				source: 'CanvasImage',
+				mediaType: 'image',
+				src: actualSrc,
+			}).unblock;
 		}, [
 			delayPlayback,
 			isLoadPending,
-			isPostmounting,
-			isPremounting,
-			pauseWhenLoading,
-		]);
+				isPostmounting,
+				isPremounting,
+				pauseWhenLoading,
+				actualSrc,
+			]);
 
 		useLayoutEffect(() => {
 			const handle = delayRender(

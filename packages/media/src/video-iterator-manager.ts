@@ -6,7 +6,10 @@ import type {
 	LogLevel,
 } from 'remotion';
 import {Internals} from 'remotion';
-import type {DelayPlaybackIfNotPremounting} from './delay-playback-if-not-premounting';
+import type {
+	DelayPlaybackIfNotPremounting,
+	DelayPlaybackMetadata,
+} from './delay-playback-if-not-premounting';
 import {roundTo4Digits} from './helpers/round-to-4-digits';
 import type {Nonce} from './nonce-manager';
 import {makePrewarmedVideoIteratorCache} from './prewarm-iterator-for-looping';
@@ -57,7 +60,9 @@ export const videoIteratorManager = async ({
 	requireCanvasForVideo = false,
 }: {
 	videoTrack: InputVideoTrack;
-	delayPlaybackHandleIfNotPremounting: () => DelayPlaybackIfNotPremounting;
+	delayPlaybackHandleIfNotPremounting: (
+		metadata?: DelayPlaybackMetadata,
+	) => DelayPlaybackIfNotPremounting;
 	context: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
 	canvas: OffscreenCanvas | HTMLCanvasElement | null;
 	getOnVideoFrameCallback: () => null | ((frame: CanvasImageSource) => void);
@@ -106,12 +111,25 @@ export const videoIteratorManager = async ({
 	const prewarmedVideoIteratorCache =
 		makePrewarmedVideoIteratorCache(canvasSink);
 
-	const blockUntilVideoCanPaint = () => {
+	const blockUntilVideoCanPaint = ({
+		reason,
+		frameTime,
+	}: {
+		reason: string;
+		frameTime?: number | null;
+	}) => {
 		if (!requireCanvasForVideo || paintReadinessHandle) {
 			return;
 		}
 
-		paintReadinessHandle = delayPlaybackHandleIfNotPremounting();
+		paintReadinessHandle = delayPlaybackHandleIfNotPremounting({
+			operation: 'video-paint-readiness',
+			renderer: 'mediabunny-canvas',
+			mediaType: 'video',
+			reason,
+			requestedTimeInSeconds: currentSeek,
+			frameTimeInSeconds: frameTime ?? null,
+		});
 	};
 
 	const releaseVideoPaintReadiness = () => {
@@ -132,7 +150,7 @@ export const videoIteratorManager = async ({
 				return true;
 			}
 
-			blockUntilVideoCanPaint();
+			blockUntilVideoCanPaint({reason: 'missing-canvas-or-context'});
 			return false;
 		}
 
@@ -160,7 +178,10 @@ export const videoIteratorManager = async ({
 			// A decoded frame is not ready for playback until the visual target has
 			// actually accepted it. Keep the global buffer blocked when painting
 			// fails, and allow a later frame to retry the same target.
-			blockUntilVideoCanPaint();
+			blockUntilVideoCanPaint({
+				reason: 'paint-error',
+				frameTime: frame.timestamp,
+			});
 			Internals.Log.verbose(
 				{logLevel, tag: '@remotion/media'},
 				'[MediaPlayer] Could not paint decoded video frame; keeping playback buffered',
@@ -223,7 +244,13 @@ export const videoIteratorManager = async ({
 	): Promise<void> => {
 		clearLastDrawnFrame();
 		videoFrameIterator?.destroy();
-		using delayHandle = delayPlaybackHandleIfNotPremounting();
+		using delayHandle = delayPlaybackHandleIfNotPremounting({
+			operation: 'video-decode-iterator',
+			renderer: 'mediabunny-canvas',
+			mediaType: 'video',
+			reason: 'waiting-for-initial-video-frame',
+			requestedTimeInSeconds: timeToSeek,
+		});
 		currentDelayHandle = delayHandle;
 		currentSeek = timeToSeek;
 

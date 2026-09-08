@@ -34,8 +34,10 @@ export const makeAudioIterator = ({
 	let mostRecentTimestamp = -Infinity;
 
 	const cleanupAudioQueue = (stopAtTime?: number) => {
-		for (const {node} of queuedAudioNodes) {
+		const nodesToCleanUp = queuedAudioNodes.splice(0);
+		for (const {node} of nodesToCleanUp) {
 			unscheduleAudioNode(node);
+			node.onended = null;
 			try {
 				if (stopAtTime === undefined) {
 					node.stop();
@@ -47,8 +49,13 @@ export const makeAudioIterator = ({
 				// Cleanup is a safe boundary: it must continue stopping other nodes.
 			}
 		}
+	};
 
-		queuedAudioNodes.length = 0;
+	const removeEndedAudioNode = (queuedNode: QueuedNode) => {
+		const index = queuedAudioNodes.indexOf(queuedNode);
+		if (index !== -1) {
+			queuedAudioNodes.splice(index, 1);
+		}
 	};
 
 	const getNextFn = async () => {
@@ -80,7 +87,15 @@ export const makeAudioIterator = ({
 
 		addQueuedAudioNode: (queuedNode: QueuedNode) => {
 			queuedAudioNodes.push(queuedNode);
+			// Do not retain every AudioBufferSourceNode for the lifetime of the
+			// iterator. Anchor changes and seeks only need to stop nodes that are
+			// still scheduled or playing; retaining ended nodes makes a later
+			// teardown O(number of historical chunks) for every feed.
+			queuedNode.node.onended = () => {
+				removeEndedAudioNode(queuedNode);
+			};
 		},
+		getQueuedAudioNodeCount: () => queuedAudioNodes.length,
 		guessNextTimestamp: () => {
 			return !Number.isFinite(mostRecentTimestamp)
 				? startFromSecond

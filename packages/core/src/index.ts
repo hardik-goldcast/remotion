@@ -21,12 +21,12 @@ import {
 import {Folder, type TFolder} from './Folder.js';
 import type {StaticFile} from './get-static-files.js';
 import type {
-	AssetFieldSchema,
 	ArrayFieldSchema,
 	ArrayItemFieldSchema,
+	AssetFieldSchema,
 	CaptionsFieldSchema,
-	InteractivitySchemaField,
 	InteractivitySchema,
+	InteractivitySchemaField,
 } from './interactivity-schema.js';
 import {useIsPlayer} from './is-player.js';
 import type {LogLevel} from './log.js';
@@ -185,6 +185,7 @@ export type {
  * @description Renders a static image to a `<canvas>` and applies Remotion effects.
  * @see [Documentation](https://www.remotion.dev/docs/canvasimage)
  */
+export type {BufferBlockMetadata} from './buffering.js';
 export {CanvasImage} from './canvas-image/index.js';
 export type {CanvasImageProps} from './canvas-image/index.js';
 export type {Codec} from './codec.js';
@@ -227,8 +228,8 @@ export {
 	EasingFunction,
 	ExtrapolateType,
 	interpolate,
-	InterpolateOutputOption,
 	InterpolateOptions,
+	InterpolateOutputOption,
 	random,
 	RandomSeed,
 } from './no-react';
@@ -346,18 +347,18 @@ export type _InternalTypes = {
 
 export type {
 	AnyComposition,
-	AssetFieldSchema,
 	ArrayFieldSchema,
 	ArrayItemFieldSchema,
+	AssetFieldSchema,
 	CaptionsFieldSchema,
 	DelayRenderScope,
+	InteractivitySchema,
+	InteractivitySchemaField,
 	JsxComponentIdentity,
 	LoopDisplay,
 	RuntimeValueSnapshot,
 	RuntimeValueStore,
 	SequenceControls,
 	SequenceRegistrationControls,
-	InteractivitySchemaField,
-	InteractivitySchema,
 	UseBufferState,
 };

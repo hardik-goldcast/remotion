@@ -4,6 +4,17 @@ import type {LogLevel} from './log';
 import {playbackLogging} from './playback-logging';
 import {useBufferState} from './use-buffer-state';
 
+const getBufferedRanges = (media: HTMLMediaElement) => {
+	const ranges: Array<{start: number; end: number}> = [];
+	for (let index = 0; index < media.buffered.length; index++) {
+		ranges.push({
+			start: media.buffered.start(index),
+			end: media.buffered.end(index),
+		});
+	}
+	return ranges;
+};
+
 export const useMediaBuffering = ({
 	element,
 	shouldBuffer,
@@ -93,6 +104,22 @@ export const useMediaBuffering = ({
 		};
 
 		const blockMedia = (reason: string) => {
+			const mediaType: 'audio' | 'video' =
+				current.tagName === 'AUDIO' ? 'audio' : 'video';
+			const mediaMetadata = {
+				label: 'media-buffer',
+				source: 'useMediaBuffering',
+				mediaType,
+				src: current.currentSrc || current.src || src,
+				reason,
+				readyState: current.readyState,
+				networkState: current.networkState,
+				currentTime: current.currentTime,
+				duration: Number.isFinite(current.duration) ? current.duration : null,
+				paused: current.paused,
+				seeking: current.seeking,
+				buffered: getBufferedRanges(current),
+			};
 			setIsBuffering(true);
 			playbackLogging({
 				logLevel,
@@ -100,7 +127,7 @@ export const useMediaBuffering = ({
 				tag: 'buffer',
 				mountTime,
 			});
-			const {unblock} = buffer.delayPlayback();
+			const {unblock} = buffer.delayPlayback(mediaMetadata);
 			const onCanPlay = () => {
 				cleanup('"canplay" was fired');
 				// eslint-disable-next-line @typescript-eslint/no-use-before-define
@@ -133,7 +160,7 @@ export const useMediaBuffering = ({
 					tag: 'buffer',
 					mountTime,
 				});
-				unblock();
+				unblock(cleanupReason);
 			});
 		};
 
