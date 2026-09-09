@@ -69,6 +69,11 @@ export class MediaPlayer {
 	videoIteratorManager: VideoIteratorManager | null = null;
 
 	private playing = false;
+	// `playing` describes whether this MediaPlayer is currently allowed to run.
+	// Keep the timeline's play intent separately: a shared Remotion buffering
+	// block pauses the player temporarily, but it must not turn the next
+	// forward frame into a random seek and discard a premounted iterator.
+	private playbackIntent = false;
 	private loop = false;
 	private fps: number;
 
@@ -207,6 +212,7 @@ export class MediaPlayer {
 		this.nonceManager = makeNonceManager();
 		this.onVideoFrameCallback = onVideoFrameCallback;
 		this.playing = playing;
+		this.playbackIntent = playing;
 		this.sequenceOffset = sequenceOffset;
 		// Reuse a shared, reference-counted Input per (src, credentials,
 		// requestInit) so mounting a new range does not re-parse the container or
@@ -609,7 +615,10 @@ export class MediaPlayer {
 					nonce,
 					fps: this.fps,
 					playbackRate: this.playbackRate,
-					isPlaying: this.playing,
+					// A provider-level buffering pause is not a user pause. Preserve
+					// sequential-seek behavior so a premounted iterator can continue
+					// to its next frame instead of being restarted.
+					isPlaying: this.playbackIntent,
 				}),
 				this.audioIteratorManager?.seek({
 					newTime: this.getAudioSourceTime(newTime),
@@ -645,6 +654,7 @@ export class MediaPlayer {
 		}
 
 		this.playing = true;
+		this.playbackIntent = true;
 
 		this.drawDebugOverlay();
 	}
@@ -654,6 +664,16 @@ export class MediaPlayer {
 	) => {
 		return this.premountAwareDelayPlayback.createHandle(metadata);
 	};
+
+	/**
+	 * Store the timeline's intended play state independently from the temporary
+	 * running state. `useCommonEffects` calls pause() while a shared buffering
+	 * block is active, but forward frame delivery is still part of playback and
+	 * should continue using the existing iterator.
+	 */
+	public setPlaybackIntent(playing: boolean): void {
+		this.playbackIntent = playing;
+	}
 
 	public pause(): void {
 		if (!this.playing) {

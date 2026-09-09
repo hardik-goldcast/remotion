@@ -32,7 +32,7 @@ const NO_OP_BUFFER_STATE = {
 const AUDIO_SCHEDULER_SEEK_FADE_SECONDS = 0.01;
 const AUDIO_SCHEDULER_GAIN_GUARD_SECONDS = 0.001;
 const AUDIO_SCHEDULER_IMPLEMENTATION_VERSION =
-	'feed-v10-remotion-buffer-plus-active-audio';
+	'feed-v12-remotion-video-decode-grace';
 const AUDIO_SCHEDULER_DIAGNOSTIC_KEY = 'KeyL';
 const AUDIO_SCHEDULER_DIAGNOSTIC_HISTORY_LIMIT = 180;
 const AUDIO_SCHEDULER_BUFFERING_TRANSITION_HISTORY_LIMIT = 512;
@@ -716,7 +716,6 @@ export const AudioFeedSchedulerPreview: React.FC<{
 			lastObservedSchedulerBuffering.value = schedulerBuffering;
 			lastObservedCombinedBuffering.value = bufferingActive;
 			lastBufferingTransitionWallTime.value = wallTimeMs;
-
 		};
 		const handleAudioContextStateChange = () => {
 			const output = getOutputState();

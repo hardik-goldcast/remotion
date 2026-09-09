@@ -78,6 +78,7 @@ export type BufferingDiagnostics = Readonly<{
 	>;
 	events: ReadonlyArray<BufferingBlockEvent>;
 	exitStabilityMs: number;
+	videoDecodeEntryGraceMs: number;
 }>;
 
 type ActiveBufferBlock = {
@@ -85,6 +86,14 @@ type ActiveBufferBlock = {
 	acquiredAtMs: number;
 	metadata: BufferBlockMetadata;
 };
+
+const isDeferrableVideoDecodeBlock = (block: ActiveBufferBlock) =>
+	block.metadata.mediaType === 'video' &&
+	block.metadata.renderer === 'mediabunny-canvas' &&
+	block.metadata.operation === 'video-decode-iterator' &&
+	block.metadata.reason === 'waiting-for-initial-video-frame' &&
+	block.metadata.isPremounting === false &&
+	block.metadata.isPostmounting === false;
 
 type BufferManager = {
 	addBlock: (metadata?: BufferBlockMetadata) => {
@@ -98,6 +107,10 @@ type BufferManager = {
 // not a real recovery; keeping the shared state active across that gap avoids
 // repeatedly suspending and resuming the one native AudioContext.
 export const BUFFERING_EXIT_STABILITY_MS = 500;
+// Dense cuts can briefly wait for the first frame of several active visual
+// players. Give that expected handoff a chance to complete before taking the
+// whole player, including the shared audio context, into buffering.
+export const BUFFERING_VIDEO_DECODE_ENTRY_GRACE_MS = 300;
 const BUFFERING_EVENT_HISTORY_LIMIT = 256;
 
 const getBufferingNow = () =>
@@ -118,6 +131,7 @@ const useBufferManager = (
 	const activeBlocksRef = useRef<Map<number, ActiveBufferBlock>>(new Map());
 	const blockEventsRef = useRef<BufferingBlockEvent[]>([]);
 	const nextBlockIdRef = useRef(0);
+	const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const exitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	const env = useRemotionEnvironment();
@@ -196,6 +210,10 @@ const useBufferManager = (
 	);
 
 	useEffect(() => {
+		if (enterTimerRef.current !== null) {
+			clearTimeout(enterTimerRef.current);
+			enterTimerRef.current = null;
+		}
 		if (exitTimerRef.current !== null) {
 			clearTimeout(exitTimerRef.current);
 			exitTimerRef.current = null;
@@ -209,6 +227,35 @@ const useBufferManager = (
 		// already buffering (e.g. a second media element starts loading) must
 		// not re-dispatch `waiting` to listeners.
 		if (blockCount > 0 && !isBuffering()) {
+			const activeBlocks = Array.from(activeBlocksRef.current.values());
+			const onlyDeferrableVideoDecodeBlocks =
+				activeBlocks.length > 0 &&
+				activeBlocks.every(isDeferrableVideoDecodeBlock);
+
+			if (onlyDeferrableVideoDecodeBlocks) {
+				const timer = setTimeout(() => {
+					enterTimerRef.current = null;
+					if (activeBlocksRef.current.size === 0 || isBuffering()) {
+						return;
+					}
+
+					setBuffering(true);
+					playbackLogging({
+						logLevel,
+						message: `Player is entering buffer state after ${BUFFERING_VIDEO_DECODE_ENTRY_GRACE_MS}ms of active video decode waits`,
+						mountTime,
+						tag: 'player',
+					});
+				}, BUFFERING_VIDEO_DECODE_ENTRY_GRACE_MS);
+				enterTimerRef.current = timer;
+				return () => {
+					if (enterTimerRef.current === timer) {
+						clearTimeout(timer);
+						enterTimerRef.current = null;
+					}
+				};
+			}
+
 			setBuffering(true);
 			playbackLogging({
 				logLevel,
@@ -263,6 +310,7 @@ const useBufferManager = (
 				metadata: cloneMetadata(event.metadata),
 			})),
 			exitStabilityMs: BUFFERING_EXIT_STABILITY_MS,
+			videoDecodeEntryGraceMs: BUFFERING_VIDEO_DECODE_ENTRY_GRACE_MS,
 		};
 	}, [isBuffering]);
 

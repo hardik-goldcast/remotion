@@ -57,6 +57,7 @@ export const useCommonEffects = ({
 		const mediaPlayer = mediaPlayerRef.current;
 		if (!mediaPlayer) return;
 
+		mediaPlayer.setPlaybackIntent(playing);
 		if (playing && !isPlayerBuffering) {
 			mediaPlayer.play();
 		} else {
@@ -179,12 +180,7 @@ export const useCommonEffects = ({
 		}
 
 		mediaPlayer.setPremountingState(isPremounting, isPostmounting);
-	}, [
-		isPremounting,
-		isPostmounting,
-		mediaPlayerReady,
-		mediaPlayerRef,
-	]);
+	}, [isPremounting, isPostmounting, mediaPlayerReady, mediaPlayerRef]);
 
 	useLayoutEffect(() => {
 		const mediaPlayer = mediaPlayerRef.current;

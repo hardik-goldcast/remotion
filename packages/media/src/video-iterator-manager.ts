@@ -85,6 +85,7 @@ export const videoIteratorManager = async ({
 	let paintReadinessHandle: DelayPlaybackIfNotPremounting | null = null;
 	let lastDrawnFrame: WrappedCanvas | null = null;
 	let currentSeek: number | null = null;
+	let iteratorStartGeneration = 0;
 
 	const clearLastDrawnFrame = () => {
 		lastDrawnFrame = null;
@@ -194,10 +195,10 @@ export const videoIteratorManager = async ({
 		return true;
 	};
 
-	const drawFrame = async (frame: WrappedCanvas): Promise<void> => {
+	const drawFrame = async (frame: WrappedCanvas): Promise<boolean> => {
 		const painted = await paintFrame(frame);
 		if (!painted) {
-			return;
+			return false;
 		}
 
 		lastDrawnFrame = frame;
@@ -214,6 +215,8 @@ export const videoIteratorManager = async ({
 			{logLevel, tag: '@remotion/media'},
 			`[MediaPlayer] Drew frame ${frame.timestamp.toFixed(3)}s`,
 		);
+
+		return true;
 	};
 
 	const redrawCurrentFrame = async (): Promise<void> => {
@@ -242,8 +245,14 @@ export const videoIteratorManager = async ({
 		timeToSeek: number,
 		nonce: Nonce,
 	): Promise<void> => {
-		clearLastDrawnFrame();
-		videoFrameIterator?.destroy();
+		const generation = ++iteratorStartGeneration;
+		const previousIterator = videoFrameIterator;
+
+		// Do not tear down the current iterator until the replacement has a frame
+		// that was successfully painted. This is the activation handoff used by
+		// premounted Sequences: the old frame remains available while the new
+		// iterator is being decoded, and a failed/stale replacement cannot leave
+		// the canvas blank.
 		using delayHandle = delayPlaybackHandleIfNotPremounting({
 			operation: 'video-decode-iterator',
 			renderer: 'mediabunny-canvas',
@@ -259,7 +268,11 @@ export const videoIteratorManager = async ({
 			prewarmedVideoIteratorCache,
 		);
 		videoIteratorsCreated++;
-		videoFrameIterator = iterator;
+
+		if (generation !== iteratorStartGeneration) {
+			iterator.destroy();
+			return;
+		}
 
 		if (iterator.isDestroyed()) {
 			return;
@@ -269,23 +282,41 @@ export const videoIteratorManager = async ({
 			// During a paused scrub, every seek goes stale before its decode
 			// lands, so returning undrawn would discard every frame and freeze
 			// the preview. Painting is safe: the newer seek always lands last.
-			if (!videoFrameIterator.isDestroyed() && iterator.initialFrame) {
-				await drawFrame(iterator.initialFrame);
+			if (iterator.initialFrame) {
+				const painted = await drawFrame(iterator.initialFrame);
+				if (!painted) {
+					iterator.destroy();
+					return;
+				}
 			}
 
+			if (previousIterator && previousIterator !== iterator) {
+				previousIterator.destroy();
+			}
+			videoFrameIterator = iterator;
 			return;
 		}
 
-		if (videoFrameIterator.isDestroyed()) {
+		if (iterator.isDestroyed()) {
 			return;
 		}
 
 		if (!iterator.initialFrame) {
 			// media ended
+			iterator.destroy();
 			return;
 		}
 
-		await drawFrame(iterator.initialFrame);
+		const painted = await drawFrame(iterator.initialFrame);
+		if (!painted || generation !== iteratorStartGeneration) {
+			iterator.destroy();
+			return;
+		}
+
+		if (previousIterator && previousIterator !== iterator) {
+			previousIterator.destroy();
+		}
+		videoFrameIterator = iterator;
 	};
 
 	const seek = async ({
@@ -363,6 +394,7 @@ export const videoIteratorManager = async ({
 		getVideoIteratorsCreated: () => videoIteratorsCreated,
 		seek,
 		destroy: () => {
+			iteratorStartGeneration++;
 			clearLastDrawnFrame();
 			prewarmedVideoIteratorCache.destroy();
 			videoFrameIterator?.destroy();
