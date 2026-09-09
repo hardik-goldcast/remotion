@@ -131,14 +131,16 @@ const AudioForPreviewAssertedShowing: React.FC<NewAudioForPreviewProps> = ({
 
 	const isPlayerBuffering = useBuffering();
 	const initialPlaying = useRef(playing && !isPlayerBuffering);
-	const initialIsPremounting = useRef(isPremounting);
-	const initialIsPostmounting = useRef(isPostmounting);
 	const initialGlobalPlaybackRate = useRef(globalPlaybackRate);
 	const initialPlaybackRate = useRef(playbackRate);
 	const initialMuted = useRef(effectiveMuted);
 	const initialVolume = useRef(userPreferredVolume);
 	const initialDurationInFrames = useRef(videoConfig.durationInFrames);
 	const initialSequenceOffset = useRef(sequenceOffset);
+	const isPremountingRef = useRef(isPremounting);
+	isPremountingRef.current = isPremounting;
+	const isPostmountingRef = useRef(isPostmounting);
+	isPostmountingRef.current = isPostmounting;
 
 	useCommonEffects({
 		mediaPlayerRef,
@@ -202,8 +204,10 @@ const AudioForPreviewAssertedShowing: React.FC<NewAudioForPreviewProps> = ({
 				audioStreamIndex: audioStreamIndex ?? null,
 				debugOverlay: false,
 				bufferState: buffer,
-				isPostmounting: initialIsPostmounting.current,
-				isPremounting: initialIsPremounting.current,
+				// The effect may rerun while this component stays mounted. Use the
+				// current Sequence lifecycle state for a newly created player.
+				isPostmounting: isPostmountingRef.current,
+				isPremounting: isPremountingRef.current,
 				globalPlaybackRate: initialGlobalPlaybackRate.current,
 				durationInFrames: initialDurationInFrames.current,
 				onVideoFrameCallback: null,

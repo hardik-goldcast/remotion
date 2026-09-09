@@ -800,6 +800,17 @@ export class MediaPlayer {
 		processNext();
 	}
 
+	public setPremountingState(
+		isPremounting: boolean,
+		isPostmounting: boolean,
+	): void {
+		this.premountAwareDelayPlayback.setLifecycle({
+			isPremounting,
+			isPostmounting,
+		});
+		processNext();
+	}
+
 	public async setLoop(
 		loop: boolean,
 		unloopedTimeInSeconds: number,

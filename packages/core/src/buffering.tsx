@@ -35,6 +35,14 @@ export type BufferBlockMetadata = Readonly<{
 	sequenceDurationInFrames?: number | null;
 	isPremounting?: boolean;
 	isPostmounting?: boolean;
+	/**
+	 * Lifecycle state at the time a premount-aware handle was created. These
+	 * fields are diagnostic only; the effective isPremounting/isPostmounting
+	 * values below are captured when the provider block is acquired.
+	 */
+	premountingAtHandleCreation?: boolean;
+	postmountingAtHandleCreation?: boolean;
+	premountLifecycleVersion?: number | null;
 	requireCanvasForVideo?: boolean | null;
 	stack?: string | null;
 	readyState?: number | null;

@@ -6,13 +6,14 @@ import type {
 
 type TrackedDelayHandle = {
 	arm: () => void;
-	disarm: () => void;
+	disarm: (reason?: string) => void;
 	dispose: () => void;
 };
 
 export class PremountAwareDelayPlayback {
 	private isPremounting: boolean;
 	private isPostmounting: boolean;
+	private lifecycleVersion = 0;
 	private readonly activeHandles = new Set<TrackedDelayHandle>();
 	private readonly delayPlayback: ReturnType<
 		typeof useBufferState
@@ -40,52 +41,105 @@ export class PremountAwareDelayPlayback {
 		return !this.isPremounting && !this.isPostmounting;
 	}
 
-	private syncHandles(): void {
+	private syncHandles(reason: string): void {
 		for (const handle of this.activeHandles) {
 			if (this.shouldDelayPlayback()) {
 				handle.arm();
 			} else {
-				handle.disarm();
+				handle.disarm(reason);
 			}
 		}
 	}
 
-	public setIsPremounting(isPremounting: boolean): void {
+	/**
+	 * Update both Sequence lifecycle flags as one transition. A sequence can
+	 * move from premounting to postmounting (or the reverse) in one React
+	 * commit. Applying the flags separately can briefly make the player look
+	 * active and acquire a shared buffering lease in between the two updates.
+	 */
+	public setLifecycle({
+		isPremounting,
+		isPostmounting,
+	}: {
+		isPremounting: boolean;
+		isPostmounting: boolean;
+	}): void {
+		if (
+			this.isPremounting === isPremounting &&
+			this.isPostmounting === isPostmounting
+		) {
+			return;
+		}
+
 		this.isPremounting = isPremounting;
-		this.syncHandles();
+		this.isPostmounting = isPostmounting;
+		this.lifecycleVersion++;
+		this.syncHandles(
+			this.shouldDelayPlayback()
+				? 'premounting-ended'
+				: 'premounting-or-postmounting-started',
+		);
+	}
+
+	public setIsPremounting(isPremounting: boolean): void {
+		this.setLifecycle({
+			isPremounting,
+			isPostmounting: this.isPostmounting,
+		});
 	}
 
 	public setIsPostmounting(isPostmounting: boolean): void {
-		this.isPostmounting = isPostmounting;
-		this.syncHandles();
+		this.setLifecycle({
+			isPremounting: this.isPremounting,
+			isPostmounting,
+		});
 	}
 
 	public createHandle(
 		metadata?: DelayPlaybackMetadata,
 	): DelayPlaybackIfNotPremounting {
 		let armed = false;
-		let unblock: (() => void) | null = null;
+		let unblock: ((reason?: string) => void) | null = null;
 		let disposed = false;
-		const resolvedMetadata = {
-			...this.baseMetadata,
-			...(metadata ?? {}),
-		};
+		const premountingAtHandleCreation = this.isPremounting;
+		const postmountingAtHandleCreation = this.isPostmounting;
 
 		const arm = () => {
-			if (armed || disposed) {
+			// This check is deliberately repeated at acquisition time. A handle
+			// can be created by an async iterator while its React component is
+			// still in a premounting state.
+			if (armed || disposed || !this.shouldDelayPlayback()) {
 				return;
 			}
 
-			unblock = this.delayPlayback(resolvedMetadata).unblock;
+			const metadataAtAcquisition: DelayPlaybackMetadata = {
+				...this.baseMetadata,
+				...(metadata ?? {}),
+				// The lifecycle object is authoritative. Do not allow a stale
+				// constructor snapshot supplied by baseMetadata to mislabel a
+				// block, or to make later diagnostics look like a premount block.
+				isPremounting: this.isPremounting,
+				isPostmounting: this.isPostmounting,
+				premountingAtHandleCreation,
+				postmountingAtHandleCreation,
+				premountLifecycleVersion: this.lifecycleVersion,
+			};
+
 			armed = true;
+			try {
+				unblock = this.delayPlayback(metadataAtAcquisition).unblock;
+			} catch (error) {
+				armed = false;
+				throw error;
+			}
 		};
 
-		const disarm = () => {
+		const disarm = (reason?: string) => {
 			if (!armed) {
 				return;
 			}
 
-			unblock?.();
+			unblock?.(reason);
 			unblock = null;
 			armed = false;
 		};
@@ -102,7 +156,7 @@ export class PremountAwareDelayPlayback {
 			}
 
 			disposed = true;
-			disarm();
+			disarm('handle-disposed');
 			this.activeHandles.delete(entry);
 		};
 

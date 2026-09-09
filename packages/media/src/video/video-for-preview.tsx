@@ -205,8 +205,6 @@ const VideoForPreviewAssertedShowing: React.FC<
 
 	const isPlayerBuffering = useBuffering();
 	const initialPlaying = useRef(playing && !isPlayerBuffering);
-	const initialIsPremounting = useRef(isPremounting);
-	const initialIsPostmounting = useRef(isPostmounting);
 	const initialGlobalPlaybackRate = useRef(globalPlaybackRate);
 	const initialPlaybackRate = useRef(playbackRate);
 	const initialToneFrequency = useRef(toneFrequency);
@@ -217,6 +215,8 @@ const VideoForPreviewAssertedShowing: React.FC<
 	const hasDrawnRealFrameRef = useRef(false);
 	const isPremountingRef = useRef(isPremounting);
 	isPremountingRef.current = isPremounting;
+	const isPostmountingRef = useRef(isPostmounting);
+	isPostmountingRef.current = isPostmounting;
 
 	useLayoutEffect(() => {
 		if (!_experimentalInitiallyDrawCachedFrame) {
@@ -295,8 +295,11 @@ const VideoForPreviewAssertedShowing: React.FC<
 					pauseWhenBuffering === false
 						? NO_OP_VIDEO_BUFFER_STATE
 						: buffer,
-				isPremounting: initialIsPremounting.current,
-				isPostmounting: initialIsPostmounting.current,
+				// This effect can rerun when the source/preload changes while the
+				// component remains mounted. Read the current Sequence lifecycle
+				// state instead of the flags from the component's first render.
+				isPremounting: isPremountingRef.current,
+				isPostmounting: isPostmountingRef.current,
 				globalPlaybackRate: initialGlobalPlaybackRate.current,
 				durationInFrames: initialSequenceDuration.current,
 				onVideoFrameCallback: initialOnVideoFrameRef.current ?? null,
