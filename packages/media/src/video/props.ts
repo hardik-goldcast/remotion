@@ -74,6 +74,7 @@ type OptionalVideoProps = {
 	credentials: RequestCredentials | undefined;
 	requestInit: MediaRequestInit | undefined;
 	objectFit: VideoObjectFit;
+	pauseWhenBuffering: boolean;
 	_experimentalInitiallyDrawCachedFrame: boolean;
 	effects: EffectsProp;
 };

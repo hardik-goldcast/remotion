@@ -1,4 +1,4 @@
-import type {Input} from 'mediabunny';
+import type {Input, InputAudioTrack} from 'mediabunny';
 import type {
 	EffectChainState,
 	EffectDefinitionAndStack,
@@ -12,13 +12,19 @@ import {
 	audioIteratorManager,
 	type AudioIteratorManager,
 } from './audio-iterator-manager';
+import type {AudioTimeline} from './audio/audio-timeline';
 import {
 	getDurationOfNode,
 	getScheduledTime,
 	getTrimStartForAudioNode,
 } from './audio/get-scheduled-time';
+import {
+	predecodeAudioWindow,
+	type PredecodedAudioWindow,
+} from './audio/predecode-audio-window';
 import {processNext} from './audio/sort-by-priority';
 import {drawPreviewOverlay} from './debug-overlay/preview-overlay';
+import type {DelayPlaybackMetadata} from './delay-playback-if-not-premounting';
 import {acquireSharedInput} from './get-shared-input';
 import {calculateEndTime, getTimeInSeconds} from './get-time-in-seconds';
 import {resolveAudioTrack} from './helpers/resolve-audio-track';
@@ -39,6 +45,8 @@ export type MediaPlayerInitResult =
 	| {type: 'network-error'}
 	| {type: 'no-tracks'}
 	| {type: 'disposed'};
+
+let nextMediaPlayerBufferingInstanceId = 0;
 
 export class MediaPlayer {
 	private tagType: 'audio' | 'video';
@@ -61,6 +69,11 @@ export class MediaPlayer {
 	videoIteratorManager: VideoIteratorManager | null = null;
 
 	private playing = false;
+	// `playing` describes whether this MediaPlayer is currently allowed to run.
+	// Keep the timeline's play intent separately: a shared Remotion buffering
+	// block pauses the player temporarily, but it must not turn the next
+	// forward frame into a random seek and discard a premounted iterator.
+	private playbackIntent = false;
 	private loop = false;
 	private fps: number;
 
@@ -68,9 +81,12 @@ export class MediaPlayer {
 	private trimAfter: number | undefined;
 	private sequenceDurationInFrames: number;
 	private sequenceOffset: number;
+	private audioTimeline: AudioTimeline | null;
+	private audioSchedulingMaxAheadSeconds: number | (() => number) | undefined;
 	private requireCanvasForVideo: boolean;
 
 	private totalDuration: number | undefined;
+	private audioTrack: InputAudioTrack | null = null;
 
 	private debugOverlay = false;
 
@@ -117,6 +133,9 @@ export class MediaPlayer {
 		getEffects,
 		getEffectChainState,
 		requireCanvasForVideo = false,
+		audioTimeline = null,
+		audioSchedulingMaxAheadSeconds,
+		bufferingLabel,
 	}: {
 		canvas: HTMLCanvasElement | OffscreenCanvas | null;
 		src: string;
@@ -147,9 +166,13 @@ export class MediaPlayer {
 			height: number,
 		) => EffectChainState | null;
 		requireCanvasForVideo?: boolean;
+		audioTimeline?: AudioTimeline | null;
+		audioSchedulingMaxAheadSeconds?: number | (() => number);
+		bufferingLabel?: string;
 	}) {
 		this.canvas = canvas ?? null;
 		this.src = src;
+		this.tagType = tagType;
 		this.logLevel = logLevel;
 		this.sharedAudioContext = sharedAudioContext;
 		this.playbackRate = playbackRate;
@@ -161,16 +184,35 @@ export class MediaPlayer {
 		this.audioStreamIndex = audioStreamIndex;
 		this.fps = fps;
 		this.debugOverlay = debugOverlay;
+		const bufferingInstanceId = `media-player-${nextMediaPlayerBufferingInstanceId++}`;
 		this.premountAwareDelayPlayback = new PremountAwareDelayPlayback({
 			bufferState,
 			isPremounting,
 			isPostmounting,
+			baseMetadata: {
+				label: bufferingLabel ?? `MediaPlayer:${tagType}`,
+				source: 'MediaPlayer',
+				mediaType: tagType,
+				src: this.src,
+				renderer:
+					tagType === 'video' ? 'mediabunny-canvas' : 'mediabunny-audio',
+				instanceId: bufferingInstanceId,
+				sequenceOffsetInSeconds: sequenceOffset,
+				sequenceDurationInFrames: durationInFrames,
+				isPremounting,
+				isPostmounting,
+				requireCanvasForVideo:
+					tagType === 'video' ? requireCanvasForVideo : null,
+			},
 		});
 		this.sequenceDurationInFrames = durationInFrames;
 		this.requireCanvasForVideo = requireCanvasForVideo;
+		this.audioTimeline = audioTimeline;
+		this.audioSchedulingMaxAheadSeconds = audioSchedulingMaxAheadSeconds;
 		this.nonceManager = makeNonceManager();
 		this.onVideoFrameCallback = onVideoFrameCallback;
 		this.playing = playing;
+		this.playbackIntent = playing;
 		this.sequenceOffset = sequenceOffset;
 		// Reuse a shared, reference-counted Input per (src, credentials,
 		// requestInit) so mounting a new range does not re-parse the container or
@@ -184,7 +226,6 @@ export class MediaPlayer {
 		this.input = input;
 		this.getDuration = getDuration;
 		this.releaseInput = release;
-		this.tagType = tagType;
 		this.getEffects = getEffects;
 		this.getEffectChainState = getEffectChainState;
 
@@ -232,10 +273,18 @@ export class MediaPlayer {
 	}
 
 	private getStartTime(): number {
+		if (this.audioTimeline) {
+			return this.audioTimeline.sourceStartTimeInSeconds;
+		}
+
 		return (this.trimBefore ?? 0) / this.fps;
 	}
 
 	private getSequenceEndTimestamp(): number {
+		if (this.audioTimeline) {
+			return this.audioTimeline.sourceEndTimeInSeconds;
+		}
+
 		// Cap at the media time corresponding to the end of the sequence
 		return (
 			(this.sequenceDurationInFrames / this.fps) * this.playbackRate +
@@ -244,10 +293,18 @@ export class MediaPlayer {
 	}
 
 	private getSequenceDurationInSeconds(): number {
+		if (this.audioTimeline) {
+			return this.audioTimeline.compositionDurationInSeconds;
+		}
+
 		return this.sequenceDurationInFrames / this.fps;
 	}
 
 	private getMediaEndTimestamp(): number {
+		if (this.audioTimeline) {
+			return this.audioTimeline.sourceEndTimeInSeconds;
+		}
+
 		return calculateEndTime({
 			mediaDurationInSeconds: this.totalDuration!,
 			ifNoMediaDuration: 'fail',
@@ -270,7 +327,11 @@ export class MediaPlayer {
 		initialMuted: boolean,
 		initialVolume: number,
 	): Promise<MediaPlayerInitResult> {
-		using _ = this.delayPlaybackHandleIfNotPremounting();
+		using _ = this.delayPlaybackHandleIfNotPremounting({
+			operation: 'media-player-initialize',
+			reason: 'initializing-media-player',
+			requestedTimeInSeconds: startTimeUnresolved,
+		});
 		try {
 			if (this.isDisposalError()) {
 				return {type: 'disposed'};
@@ -318,6 +379,10 @@ export class MediaPlayer {
 			if (!videoTrack && !audioTrack) {
 				return {type: 'no-tracks'};
 			}
+
+			// Keep the resolved track available even when this MediaPlayer is used as
+			// a decoder-only helper with no shared audio context.
+			this.audioTrack = audioTrack;
 
 			if (videoTrack && this.tagType === 'video') {
 				if (await videoTrack.isLive()) {
@@ -411,6 +476,11 @@ export class MediaPlayer {
 					drawDebugOverlay: this.drawDebugOverlay,
 					getSequenceDurationInSeconds: () =>
 						this.getSequenceDurationInSeconds(),
+					mapAudioBufferSlice: this.audioTimeline?.mapAudioBufferSlice,
+					audioSourceRanges: this.audioTimeline?.sourceRanges,
+					mapAudioSourceTimeToTimeline:
+						this.audioTimeline?.getCompositionTimeForSourceTime,
+					maxAheadSeconds: this.audioSchedulingMaxAheadSeconds,
 				});
 			}
 
@@ -422,8 +492,9 @@ export class MediaPlayer {
 						? this.audioIteratorManager.startAudioIterator({
 								nonce,
 								playbackRate: this.playbackRate * this.globalPlaybackRate,
-								startFromSecond: startTime,
-								unloopedStartFromSecond: startTimeUnresolved,
+								startFromSecond: this.getAudioSourceTime(startTime),
+								unloopedStartFromSecond:
+									this.getAudioSourceTime(startTimeUnresolved),
 								scheduleAudioNode: this.scheduleAudioNode,
 								getTargetTime: this.getTargetTime,
 								logLevel: this.logLevel,
@@ -497,6 +568,37 @@ export class MediaPlayer {
 		await this.seekToWithQueue(newTime, time);
 	}
 
+	/**
+	 * Decode and assemble a compact composition-time audio window without
+	 * starting the live AudioBufferSourceNode scheduler. This is used by the
+	 * audio scheduler's predecode diagnostic and intentionally requires the
+	 * grouped audio timeline.
+	 */
+	public async predecodeAudioWindow({
+		fromCompositionTimeInSeconds,
+		toCompositionTimeInSeconds,
+	}: {
+		fromCompositionTimeInSeconds: number;
+		toCompositionTimeInSeconds: number;
+	}): Promise<PredecodedAudioWindow> {
+		if (!this.audioTrack) {
+			throw new Error('Audio track is not initialized.');
+		}
+
+		if (!this.audioTimeline) {
+			throw new Error(
+				'Predecoded audio windows require a grouped audio timeline.',
+			);
+		}
+
+		return predecodeAudioWindow({
+			audioTrack: this.audioTrack,
+			audioTimeline: this.audioTimeline,
+			fromCompositionTimeInSeconds,
+			toCompositionTimeInSeconds,
+		});
+	}
+
 	private async seekToDoNotCallDirectly(
 		newTime: number,
 		unloopedNewTime: number,
@@ -513,11 +615,14 @@ export class MediaPlayer {
 					nonce,
 					fps: this.fps,
 					playbackRate: this.playbackRate,
-					isPlaying: this.playing,
+					// A provider-level buffering pause is not a user pause. Preserve
+					// sequential-seek behavior so a premounted iterator can continue
+					// to its next frame instead of being restarted.
+					isPlaying: this.playbackIntent,
 				}),
 				this.audioIteratorManager?.seek({
-					newTime,
-					unloopedNewTime,
+					newTime: this.getAudioSourceTime(newTime),
+					unloopedNewTime: this.getAudioSourceTime(unloopedNewTime),
 					nonce,
 					playbackRate: this.playbackRate * this.globalPlaybackRate,
 					localPlaybackRate: this.playbackRate,
@@ -549,13 +654,26 @@ export class MediaPlayer {
 		}
 
 		this.playing = true;
+		this.playbackIntent = true;
 
 		this.drawDebugOverlay();
 	}
 
-	private delayPlaybackHandleIfNotPremounting = () => {
-		return this.premountAwareDelayPlayback.createHandle();
+	private delayPlaybackHandleIfNotPremounting = (
+		metadata?: DelayPlaybackMetadata,
+	) => {
+		return this.premountAwareDelayPlayback.createHandle(metadata);
 	};
+
+	/**
+	 * Store the timeline's intended play state independently from the temporary
+	 * running state. `useCommonEffects` calls pause() while a shared buffering
+	 * block is active, but forward frame delivery is still part of playback and
+	 * should continue using the existing iterator.
+	 */
+	public setPlaybackIntent(playing: boolean): void {
+		this.playbackIntent = playing;
+	}
 
 	public pause(): void {
 		if (!this.playing) {
@@ -564,6 +682,15 @@ export class MediaPlayer {
 
 		this.playing = false;
 		this.drawDebugOverlay();
+	}
+
+	/**
+	 * Wake the global audio queue without treating normal playback progress as
+	 * a seek. A feed player can keep its decoder iterator alive while the queue
+	 * re-evaluates its priority against the current AudioContext clock.
+	 */
+	public wakeAudioScheduling(): void {
+		processNext();
 	}
 
 	public setMuted(muted: boolean): void {
@@ -579,6 +706,10 @@ export class MediaPlayer {
 	}
 
 	private getTrimmedTime(unloopedTimeInSeconds: number): number | null {
+		if (this.audioTimeline) {
+			return unloopedTimeInSeconds;
+		}
+
 		return getTimeInSeconds({
 			unloopedTimeInSeconds,
 			playbackRate: this.playbackRate,
@@ -590,6 +721,14 @@ export class MediaPlayer {
 			ifNoMediaDuration: 'infinity',
 			src: this.src,
 		});
+	}
+
+	private getAudioSourceTime(compositionTimeInSeconds: number): number {
+		return this.audioTimeline
+			? this.audioTimeline.getSourceTimeForCompositionTime(
+					compositionTimeInSeconds,
+				)
+			: compositionTimeInSeconds;
 	}
 
 	public async setTrimBefore(
@@ -681,6 +820,17 @@ export class MediaPlayer {
 		processNext();
 	}
 
+	public setPremountingState(
+		isPremounting: boolean,
+		isPostmounting: boolean,
+	): void {
+		this.premountAwareDelayPlayback.setLifecycle({
+			isPremounting,
+			isPostmounting,
+		});
+		processNext();
+	}
+
 	public async setLoop(
 		loop: boolean,
 		unloopedTimeInSeconds: number,
@@ -759,6 +909,19 @@ export class MediaPlayer {
 			this.globalPlaybackRate;
 
 		const timeInSeconds = globalTime - this.sequenceOffset;
+
+		if (this.audioTimeline) {
+			const compositionTime =
+				this.audioTimeline.getCompositionTimeForSourceTime(mediaTimestamp);
+			if (compositionTime === null) {
+				return null;
+			}
+
+			return (
+				(compositionTime - timeInSeconds) /
+				(this.playbackRate * this.globalPlaybackRate)
+			);
+		}
 
 		// When looping, the audio iterator emits timestamps that continue
 		// monotonically across loop iterations, while the looped media time

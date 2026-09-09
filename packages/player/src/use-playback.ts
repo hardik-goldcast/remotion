@@ -29,6 +29,70 @@ const shouldForceAnchorChange = (newState: RemotionAudioContextState) => {
 	);
 };
 
+const getFrameFromSharedTransportClock = ({
+	audioContext,
+	audioSyncAnchor,
+	playbackRate,
+	fps,
+	currentFrame,
+	actualFirstFrame,
+	actualLastFrame,
+	shouldLoop,
+}: {
+	audioContext: AudioContext;
+	audioSyncAnchor: {readonly value: number};
+	playbackRate: number;
+	fps: number;
+	currentFrame: number;
+	actualFirstFrame: number;
+	actualLastFrame: number;
+	shouldLoop: boolean;
+}): {nextFrame: number; hasEnded: boolean} => {
+	// The anchor maps the continuously running AudioContext clock onto the
+	// composition timeline. Deriving the frame from this same value means the
+	// renderer and every scheduled AudioBufferSourceNode consume one transport
+	// clock instead of advancing from two independent wall clocks.
+	const globalCompositionTime =
+		(audioContext.currentTime - audioSyncAnchor.value) * playbackRate;
+	const rawFrame = (playbackRate < 0 ? Math.ceil : Math.floor)(
+		globalCompositionTime * fps,
+	);
+	const currentFrameOutsideRange =
+		currentFrame < actualFirstFrame || currentFrame > actualLastFrame;
+	const nextFrameOutsideRange =
+		rawFrame < actualFirstFrame || rawFrame > actualLastFrame;
+	const hasEnded =
+		!shouldLoop && nextFrameOutsideRange && !currentFrameOutsideRange;
+
+	if (!shouldLoop) {
+		if (hasEnded) {
+			return {
+				nextFrame: playbackRate < 0 ? actualLastFrame : actualFirstFrame,
+				hasEnded: true,
+			};
+		}
+
+		return {
+			nextFrame: Math.min(
+				actualLastFrame,
+				Math.max(actualFirstFrame, rawFrame),
+			),
+			hasEnded: false,
+		};
+	}
+
+	const loopDurationInFrames = actualLastFrame - actualFirstFrame + 1;
+	const loopOffset =
+		(((rawFrame - actualFirstFrame) % loopDurationInFrames) +
+			loopDurationInFrames) %
+		loopDurationInFrames;
+
+	return {
+		nextFrame: actualFirstFrame + loopOffset,
+		hasEnded: false,
+	};
+};
+
 export const usePlayback = ({
 	loop,
 	playbackRate,
@@ -66,7 +130,6 @@ export const usePlayback = ({
 	const isBackgroundedRef = useIsBackgrounded();
 
 	const lastTimeUpdateTimestamp = useRef<number>(0);
-	const needsAudioReanchorRef = useRef(false);
 	const wasPlayingRef = useRef(false);
 	const pendingExplicitSeekFrameRef = useRef<number | null>(null);
 
@@ -113,22 +176,31 @@ export const usePlayback = ({
 			return;
 		}
 
-		const changed = setGlobalTimeAnchor({
-			audioContext: sharedAudioContext.audioContext,
-			audioSyncAnchor: sharedAudioContext.audioSyncAnchor,
-			absoluteTimeInSeconds: frame / config.fps,
-			globalPlaybackRate: playbackRate,
-			logLevel,
-			// A seek must always re-anchor, even when the destination is less than
-			// the normal frame-quantization threshold away from the old anchor.
-			force: pendingExplicitSeekFrame === frame,
-		});
-		if (changed) {
-			sharedAudioContext.audioSyncAnchorEmitter.dispatch('changed');
+		const isExplicitSeek = pendingExplicitSeekFrame === frame;
+		// In keep-alive mode, a normal frame-clock correction is destructive: it
+		// tells every audio iterator to tear down its already-buffered sources and
+		// decode again. The context clock is still a valid transport clock, so keep
+		// the existing queue intact during ordinary drift. Explicit seeks and the
+		// pause/resume path above still force a re-anchor.
+		const shouldApplyAutomaticAnchorChange =
+			!sharedAudioContext._experimentalKeepAudioContextAlive || frame === 0;
+		if (isExplicitSeek || shouldApplyAutomaticAnchorChange) {
+			const changed = setGlobalTimeAnchor({
+				audioContext: sharedAudioContext.audioContext,
+				audioSyncAnchor: sharedAudioContext.audioSyncAnchor,
+				absoluteTimeInSeconds: frame / config.fps,
+				globalPlaybackRate: playbackRate,
+				logLevel,
+				// A seek must always re-anchor, even when the destination is less than
+				// the normal frame-quantization threshold away from the old anchor.
+				force: isExplicitSeek,
+			});
+			if (changed) {
+				sharedAudioContext.audioSyncAnchorEmitter.dispatch('changed');
+			}
 		}
 
 		if (pendingExplicitSeekFrame === frame) {
-			needsAudioReanchorRef.current = false;
 			pendingExplicitSeekFrameRef.current = null;
 		} else if (pendingExplicitSeekFrame !== null) {
 			// The pending seek was superseded before React committed its frame.
@@ -180,6 +252,13 @@ export const usePlayback = ({
 		}
 
 		const callback = () => {
+			// Buffering is a shared transport pause, not a seek. Re-anchoring here
+			// would invalidate the timestamps that the scheduler is preserving while
+			// the audio and video pipelines refill.
+			if (isBuffering()) {
+				return;
+			}
+
 			const newState = sharedAudioContext?.getAudioContextState();
 			if (newState && shouldForceAnchorChange(newState)) {
 				setGlobalTimeAnchor({
@@ -200,6 +279,7 @@ export const usePlayback = ({
 	}, [
 		config,
 		getCurrentFrame,
+		isBuffering,
 		logLevel,
 		muted,
 		playbackRate,
@@ -213,7 +293,6 @@ export const usePlayback = ({
 
 		if (!playing) {
 			wasPlayingRef.current = false;
-			needsAudioReanchorRef.current = false;
 			sharedAudioContext?.suspend?.();
 			return;
 		}
@@ -224,7 +303,8 @@ export const usePlayback = ({
 		if (
 			sharedAudioContext?._experimentalKeepAudioContextAlive &&
 			sharedAudioContext.audioContext &&
-			!muted
+			!muted &&
+			!isBuffering()
 		) {
 			// Resume first. In keep-alive mode this arms a short barrier: existing
 			// sources remain silent until the anchor change below has invalidated
@@ -266,6 +346,11 @@ export const usePlayback = ({
 			| null = null;
 		let startedTime = performance.now();
 		let framesAdvanced = 0;
+		const useSharedTransportClock = Boolean(
+			sharedAudioContext?._experimentalKeepAudioContextAlive &&
+			sharedAudioContext.audioContext &&
+			!muted,
+		);
 
 		const cancelQueuedFrame = () => {
 			if (reqAnimFrameCall !== null) {
@@ -294,41 +379,46 @@ export const usePlayback = ({
 
 			if (!muted && !audioContextFailed && !isBuffering()) {
 				sharedAudioContext?.resume?.();
-				if (
-					needsAudioReanchorRef.current &&
-					sharedAudioContext?._experimentalKeepAudioContextAlive &&
-					sharedAudioContext.audioContext
-				) {
-					setGlobalTimeAnchor({
-						audioContext: sharedAudioContext.audioContext,
-						audioSyncAnchor: sharedAudioContext.audioSyncAnchor,
-						absoluteTimeInSeconds: getCurrentFrame() / config.fps,
-						globalPlaybackRate: playbackRate,
-						logLevel,
-						force: true,
-					});
-					sharedAudioContext.audioSyncAnchorEmitter.dispatch('changed');
-					needsAudioReanchorRef.current = false;
-				}
 			}
 
-			const time = performance.now() - startedTime;
 			const actualLastFrame = outFrame ?? config.durationInFrames - 1;
 			const actualFirstFrame = inFrame ?? 0;
 
 			const currentFrame = getCurrentFrame();
-			const {nextFrame, framesToAdvance, hasEnded} = calculateNextFrame({
-				time,
-				currentFrame,
-				playbackSpeed: playbackRate,
-				fps: config.fps,
-				actualFirstFrame,
-				actualLastFrame,
-				framesAdvanced,
-				shouldLoop: loop,
-			});
-
-			framesAdvanced += framesToAdvance;
+			let nextFrame: number;
+			let hasEnded: boolean;
+			if (useSharedTransportClock && sharedAudioContext?.audioContext) {
+				const result = getFrameFromSharedTransportClock({
+					audioContext: sharedAudioContext.audioContext,
+					audioSyncAnchor: sharedAudioContext.audioSyncAnchor,
+					playbackRate,
+					fps: config.fps,
+					currentFrame,
+					actualFirstFrame,
+					actualLastFrame,
+					shouldLoop: loop,
+				});
+				nextFrame = result.nextFrame;
+				hasEnded = result.hasEnded;
+			} else {
+				const {
+					nextFrame: calculatedNextFrame,
+					framesToAdvance,
+					hasEnded: calculatedHasEnded,
+				} = calculateNextFrame({
+					time: performance.now() - startedTime,
+					currentFrame,
+					playbackSpeed: playbackRate,
+					fps: config.fps,
+					actualFirstFrame,
+					actualLastFrame,
+					framesAdvanced,
+					shouldLoop: loop,
+				});
+				framesAdvanced += framesToAdvance;
+				nextFrame = calculatedNextFrame;
+				hasEnded = calculatedHasEnded;
+			}
 
 			if (
 				nextFrame !== getCurrentFrame() &&
@@ -377,12 +467,8 @@ export const usePlayback = ({
 			}
 
 			if (isBuffering()) {
-				if (sharedAudioContext?._experimentalKeepAudioContextAlive && !muted) {
-					needsAudioReanchorRef.current = true;
-				}
-
 				if (!muted && !audioContextFailed) {
-					sharedAudioContext?.suspend?.();
+					sharedAudioContext?.suspendForBuffering?.();
 				}
 
 				const unsubscribe = subscribeBuffering((state) => {

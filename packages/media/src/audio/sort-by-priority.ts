@@ -1,9 +1,15 @@
+import {DEFAULT_AUDIO_FEED_SCHEDULER_CONFIG} from '../audio-scheduler/audio-feed-scheduler-config';
+
 type Waiter = {
 	getPriority: () => number | null;
 	fn: () => Promise<unknown>;
 	onDone: (result: unknown, triggerNext: () => void) => void;
 	onError: (err: unknown) => void;
+	concurrency: number;
+	getMaxAheadSeconds: () => number;
 };
+
+type MaxAheadSeconds = number | (() => number);
 
 export class StaleWaiterError extends Error {
 	constructor() {
@@ -12,25 +18,73 @@ export class StaleWaiterError extends Error {
 	}
 }
 
-const CONCURRENCY = 1;
+// Keep the original single-turn scheduler limit while we test buffering and
+// lookahead independently from concurrency changes.
+const DEFAULT_CONCURRENCY = 1;
+export const GROUPED_AUDIO_SCHEDULER_CONCURRENCY = 1;
+const DEFAULT_MAX_AHEAD_SECONDS = 2;
+export const GROUPED_AUDIO_SCHEDULER_MAX_AHEAD_SECONDS =
+	DEFAULT_AUDIO_FEED_SCHEDULER_CONFIG.decodeAheadSeconds;
 
 const waiters: Waiter[] = [];
 let running = 0;
-let runningEntry: {
+type RunningEntry = {
 	waiter: Waiter;
+	concurrency: number;
 	cancel: () => void;
 	settle: () => void;
-} | null = null;
+};
+const runningEntries = new Set<RunningEntry>();
+
+const countByConcurrency = (concurrencies: readonly number[]) => {
+	const counts: Record<string, number> = {};
+	for (const concurrency of concurrencies) {
+		const key = String(concurrency);
+		counts[key] = (counts[key] ?? 0) + 1;
+	}
+
+	return counts;
+};
+
+const getConcurrencyLimit = () => {
+	let limit = DEFAULT_CONCURRENCY;
+	for (const waiter of waiters) {
+		limit = Math.max(limit, waiter.concurrency);
+	}
+	for (const entry of runningEntries) {
+		limit = Math.max(limit, entry.concurrency);
+	}
+	return limit;
+};
+
+export const getAudioSchedulerQueueDiagnostics = () => ({
+	pending: waiters.length,
+	running,
+	concurrencyLimit: getConcurrencyLimit(),
+	pendingByConcurrency: countByConcurrency(
+		waiters.map((waiter) => waiter.concurrency),
+	),
+	runningByConcurrency: countByConcurrency(
+		Array.from(runningEntries, (entry) => entry.concurrency),
+	),
+});
+
+const cancelStaleRunningEntries = () => {
+	for (const entry of runningEntries) {
+		if (entry.waiter.getPriority() === null) {
+			// A stale decoder may still be resolving asynchronously, but freeing its
+			// logical turn prevents it from blocking a fresh iterator after a seek or
+			// anchor change. Its promise callback is ignored after cancellation.
+			entry.cancel();
+		}
+	}
+};
 
 export const processNext = (): void => {
-	if (running >= CONCURRENCY) {
-		if (runningEntry?.waiter.getPriority() === null) {
-			// Running entry went stale: free its slot so a fresh waiter can run
-			// instead of deadlocking behind work nobody needs anymore.
-			runningEntry.cancel();
-		} else {
-			return;
-		}
+	cancelStaleRunningEntries();
+
+	if (running >= getConcurrencyLimit()) {
+		return;
 	}
 
 	// Collect stale waiters first, remove them from the queue,
@@ -55,6 +109,7 @@ export const processNext = (): void => {
 
 	let bestIndex = 0;
 	let bestPriority = waiters[0].getPriority();
+	let bestMaxAheadSeconds = waiters[0].getMaxAheadSeconds();
 	if (bestPriority === null) {
 		throw new Error('Stale waiter should have been removed');
 	}
@@ -68,11 +123,12 @@ export const processNext = (): void => {
 		if (priority < bestPriority) {
 			bestPriority = priority;
 			bestIndex = i;
+			bestMaxAheadSeconds = waiters[i].getMaxAheadSeconds();
 		}
 	}
 
-	if (bestPriority > 2) {
-		// more than 2 seconds time, let's not do it yet!
+	if (bestPriority > bestMaxAheadSeconds) {
+		// Do not decode farther ahead than the mode requested by this waiter.
 		return;
 	}
 
@@ -81,8 +137,9 @@ export const processNext = (): void => {
 
 	let settled = false;
 	let cancelled = false;
-	const entry = {
+	const entry: RunningEntry = {
 		waiter: next,
+		concurrency: next.concurrency,
 		cancel: () => {
 			cancelled = true;
 			entry.settle();
@@ -94,12 +151,10 @@ export const processNext = (): void => {
 
 			settled = true;
 			running--;
-			if (runningEntry === entry) {
-				runningEntry = null;
-			}
+			runningEntries.delete(entry);
 		},
 	};
-	runningEntry = entry;
+	runningEntries.add(entry);
 
 	next.fn().then(
 		(value) => {
@@ -126,17 +181,34 @@ export const waitForTurn = <T>({
 	fn,
 	onDone,
 	onError,
+	concurrency,
+	maxAheadSeconds,
 }: {
 	getPriority: () => number | null;
 	fn: () => Promise<T>;
 	onDone: (result: T, triggerNext: () => void) => void;
 	onError: (err: unknown) => void;
+	concurrency?: number;
+	maxAheadSeconds?: MaxAheadSeconds;
 }): void => {
+	const getMaxAheadSeconds = () => {
+		const value =
+			typeof maxAheadSeconds === 'function'
+				? maxAheadSeconds()
+				: (maxAheadSeconds ?? DEFAULT_MAX_AHEAD_SECONDS);
+		return Math.max(0, value);
+	};
+
 	waiters.push({
 		getPriority,
 		fn,
 		onDone: onDone as (result: unknown, triggerNext: () => void) => void,
 		onError: onError as (err: unknown) => void,
+		concurrency: Math.max(
+			DEFAULT_CONCURRENCY,
+			concurrency ?? DEFAULT_CONCURRENCY,
+		),
+		getMaxAheadSeconds,
 	});
 	processNext();
 };

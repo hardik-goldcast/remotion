@@ -220,7 +220,12 @@ const ImgContent: React.FC<ImgContentProps> = ({
 				return;
 			}
 
-			return delayPlayback().unblock;
+			return delayPlayback({
+				label: 'image-load',
+				source: 'Img',
+				mediaType: 'image',
+				src: imageRef.current?.src ?? null,
+			}).unblock;
 		}, [
 			delayPlayback,
 			isLoading,

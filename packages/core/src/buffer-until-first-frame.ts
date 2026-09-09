@@ -73,23 +73,29 @@ export const useBufferUntilFirstFrame = ({
 				tag: 'buffer',
 			});
 
-			const playback = delayPlayback();
+			const playback = delayPlayback({
+				label: 'first-frame',
+				source: 'useBufferUntilFirstFrame',
+				mediaType,
+				src: current.currentSrc || current.src || null,
+				reason: 'waiting-for-first-frame',
+				readyState: current.readyState,
+				currentTime: current.currentTime,
+				duration: Number.isFinite(current.duration) ? current.duration : null,
+				paused: current.paused,
+				seeking: current.seeking,
+			});
 
-			const unblock = () => {
-				playback.unblock();
-				current.removeEventListener('ended', unblock, {
-					// @ts-expect-error
-					once: true,
-				});
-				current.removeEventListener('pause', unblock, {
-					// @ts-expect-error
-					once: true,
-				});
+			const unblock = (reason = 'first-frame-received') => {
+				playback.unblock(reason);
+				current.removeEventListener('ended', onEndedOrPauseOrCanPlay);
+				current.removeEventListener('pause', onEndedOrPauseOrCanPlay);
+				current.removeEventListener('canplay', onEndedOrPauseOrCanPlay);
 				bufferingRef.current = false;
 			};
 
 			const onEndedOrPauseOrCanPlay = () => {
-				unblock();
+				unblock('media-ended-paused-or-canplay');
 			};
 
 			current.requestVideoFrameCallback((_, info) => {
@@ -100,7 +106,7 @@ export const useBufferUntilFirstFrame = ({
 					onVariableFpsVideoDetected();
 				}
 
-				unblock();
+				unblock('first-frame-received');
 			});
 
 			current.addEventListener('ended', onEndedOrPauseOrCanPlay, {once: true});

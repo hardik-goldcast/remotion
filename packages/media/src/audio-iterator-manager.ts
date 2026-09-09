@@ -15,15 +15,22 @@ import {
 import {getScheduledTime} from './audio/get-scheduled-time';
 import {pitchShiftAudioIterator} from './audio/pitch-shift';
 import {
+	GROUPED_AUDIO_SCHEDULER_CONCURRENCY,
+	GROUPED_AUDIO_SCHEDULER_MAX_AHEAD_SECONDS,
 	processNext,
 	StaleWaiterError,
 	waitForTurn,
 } from './audio/sort-by-priority';
-import type {DelayPlaybackIfNotPremounting} from './delay-playback-if-not-premounting';
+import type {
+	DelayPlaybackIfNotPremounting,
+	DelayPlaybackMetadata,
+} from './delay-playback-if-not-premounting';
 import {
+	makeIteratorOverSourceRanges,
 	makeIteratorWithPriming,
 	makeLoopingIterator,
 	type AudioBufferSlice,
+	type AudioSourceRange,
 } from './make-iterator-with-priming';
 import type {Nonce} from './nonce-manager';
 import type {SharedAudioContextForMediaPlayer} from './shared-audio-context-for-media-player';
@@ -81,9 +88,15 @@ export const audioIteratorManager = ({
 	initialVolume,
 	toneFrequency,
 	drawDebugOverlay,
+	mapAudioBufferSlice,
+	audioSourceRanges,
+	mapAudioSourceTimeToTimeline,
+	maxAheadSeconds,
 }: {
 	audioTrack: InputAudioTrack;
-	delayPlaybackHandleIfNotPremounting: () => DelayPlaybackIfNotPremounting;
+	delayPlaybackHandleIfNotPremounting: (
+		metadata?: DelayPlaybackMetadata,
+	) => DelayPlaybackIfNotPremounting;
 	sharedAudioContext: SharedAudioContextForMediaPlayer;
 	getSequenceEndTimestamp: () => number;
 	getSequenceDurationInSeconds: () => number;
@@ -93,6 +106,12 @@ export const audioIteratorManager = ({
 	initialVolume: number;
 	toneFrequency: number;
 	drawDebugOverlay: () => void;
+	mapAudioBufferSlice?: (
+		slice: AudioBufferSlice,
+	) => readonly AudioBufferSlice[];
+	audioSourceRanges?: readonly AudioSourceRange[];
+	mapAudioSourceTimeToTimeline?: (sourceTimeInSeconds: number) => number | null;
+	maxAheadSeconds?: number | (() => number);
 }) => {
 	let muted = initialMuted;
 	let currentVolume = Math.max(0, initialVolume);
@@ -120,6 +139,17 @@ export const audioIteratorManager = ({
 	let currentAnchor: AudioIteratorAnchor | null = null;
 	let audioIteratorsCreated = 0;
 	let totalAudioScheduledInSeconds = 0;
+	let audioChunksScheduled = 0;
+	let audioChunksRejected = 0;
+	let lastAudioChunkRejectionReason: string | null = null;
+	let lastAudioChunkScheduledAtAudioTime: number | null = null;
+	let lastAudioChunkScheduledSourceTime: number | null = null;
+	let lastAudioChunkRejectedAtAudioTime: number | null = null;
+	let audioSchedulingTurnsStarted = 0;
+	let audioSchedulingTurnsCompleted = 0;
+	let lastAudioTurnStartedAtAudioTime: number | null = null;
+	let lastAudioTurnCompletedAtAudioTime: number | null = null;
+	let currentIteratorStartFromSecond: number | null = null;
 	let currentDelayHandle: {unblock: () => void} | null = null;
 
 	const unblockCurrentDelayHandle = () => {
@@ -173,13 +203,13 @@ export const audioIteratorManager = ({
 		originalUnloopedMediaTimestamp: number;
 		sourceOffsetInSeconds: number;
 		sourceDurationInSeconds: number;
-	}) => {
+	}): boolean => {
 		if (!audioBufferIterator) {
 			throw new Error('Audio buffer iterator not found');
 		}
 
 		if (muted) {
-			return;
+			return false;
 		}
 
 		const node = sharedAudioContext.audioContext.createBufferSource();
@@ -196,6 +226,10 @@ export const audioIteratorManager = ({
 		);
 
 		if (started.type === 'not-started') {
+			audioChunksRejected++;
+			lastAudioChunkRejectionReason = started.reason;
+			lastAudioChunkRejectedAtAudioTime =
+				sharedAudioContext.audioContext.currentTime;
 			Internals.Log.verbose(
 				{logLevel, tag: 'audio-scheduling'},
 				'not started, disconnected: %s %s',
@@ -204,7 +238,7 @@ export const audioIteratorManager = ({
 			);
 
 			node.disconnect();
-			return;
+			return false;
 		}
 
 		audioBufferIterator.addQueuedAudioNode({
@@ -216,6 +250,11 @@ export const audioIteratorManager = ({
 			playbackRate,
 			scheduledAtAnchor: sharedAudioContext.audioSyncAnchor.value,
 		});
+		audioChunksScheduled++;
+		lastAudioChunkScheduledAtAudioTime =
+			sharedAudioContext.audioContext.currentTime;
+		lastAudioChunkScheduledSourceTime = mediaTimestamp;
+		return true;
 	};
 
 	const onAudioChunk = ({
@@ -228,9 +267,9 @@ export const audioIteratorManager = ({
 		playbackRate: number;
 		scheduleAudioNode: ScheduleAudioNode;
 		logLevel: LogLevel;
-	}) => {
+	}): boolean => {
 		if (muted) {
-			return;
+			return false;
 		}
 
 		const startTime = getStartTime();
@@ -241,32 +280,46 @@ export const audioIteratorManager = ({
 			buffer.timelineTimestamp + buffer.sourceDurationInSeconds <=
 			startTime
 		) {
-			return;
+			return false;
 		}
 
 		if (buffer.timelineTimestamp >= sequenceEndTime) {
-			return;
+			return false;
 		}
 
-		const scheduledStart = Math.max(buffer.timelineTimestamp, startTime);
-		const scheduledEnd = Math.min(
-			buffer.timelineTimestamp + buffer.sourceDurationInSeconds,
-			sequenceEndTime,
-		);
-		totalAudioScheduledInSeconds += Math.max(0, scheduledEnd - scheduledStart);
+		// Source-range iterators yield source-order progress, including buffers that
+		// fall entirely inside deleted gaps. The feed timeline mapper removes those
+		// portions before an AudioBufferSourceNode is created.
+		const slices = mapAudioBufferSlice ? mapAudioBufferSlice(buffer) : [buffer];
+		let hasScheduledSlice = false;
+		for (const slice of slices) {
+			const sliceStart = Math.max(slice.timelineTimestamp, startTime);
+			const sliceEnd = Math.min(
+				slice.timelineTimestamp + slice.sourceDurationInSeconds,
+				sequenceEndTime,
+			);
+			if (sliceEnd <= sliceStart) {
+				continue;
+			}
 
-		scheduleAudioChunk({
-			buffer: buffer.buffer.buffer,
-			mediaTimestamp: buffer.timelineTimestamp,
-			playbackRate,
-			scheduleAudioNode,
-			logLevel,
-			originalUnloopedMediaTimestamp: buffer.buffer.timestamp,
-			sourceOffsetInSeconds: buffer.sourceOffsetInSeconds,
-			sourceDurationInSeconds: buffer.sourceDurationInSeconds,
-		});
+			const wasScheduled = scheduleAudioChunk({
+				buffer: slice.buffer.buffer,
+				mediaTimestamp: slice.timelineTimestamp,
+				playbackRate,
+				scheduleAudioNode,
+				logLevel,
+				originalUnloopedMediaTimestamp: slice.buffer.timestamp,
+				sourceOffsetInSeconds: slice.sourceOffsetInSeconds,
+				sourceDurationInSeconds: slice.sourceDurationInSeconds,
+			});
+			if (wasScheduled) {
+				hasScheduledSlice = true;
+				totalAudioScheduledInSeconds += Math.max(0, sliceEnd - sliceStart);
+			}
+		}
 
 		drawDebugOverlay();
+		return hasScheduledSlice;
 	};
 
 	const proceedScheduling = ({
@@ -279,7 +332,6 @@ export const audioIteratorManager = ({
 		onDestroyed,
 		onDone,
 		logLevel,
-		currentTime,
 		getAudioContextCurrentTimeMockedInTest,
 	}: {
 		iterator: AudioIterator;
@@ -290,17 +342,21 @@ export const audioIteratorManager = ({
 		) => number | null;
 		playbackRate: number;
 		scheduleAudioNode: ScheduleAudioNode;
-		onScheduled: (
-			sourceDurationInSeconds: number,
-			timelineTimestamp: number,
-		) => void;
+		onScheduled: (buffer: AudioBufferSlice) => void;
 		onDone: () => void;
 		onDestroyed: () => void;
 		logLevel: LogLevel;
-		currentTime: number;
 		getAudioContextCurrentTimeMockedInTest: () => number;
 	}) => {
 		waitForTurn({
+			concurrency:
+				audioSourceRanges === undefined
+					? undefined
+					: GROUPED_AUDIO_SCHEDULER_CONCURRENCY,
+			maxAheadSeconds:
+				audioSourceRanges === undefined
+					? undefined
+					: (maxAheadSeconds ?? GROUPED_AUDIO_SCHEDULER_MAX_AHEAD_SECONDS),
 			getPriority: () => {
 				if (iterator.isDestroyed()) {
 					onDestroyed();
@@ -308,6 +364,12 @@ export const audioIteratorManager = ({
 				}
 
 				const guessedNextTimestamp = iterator.guessNextTimestamp();
+				// This manager can live for the entire duration of a feed. The priority
+				// must be calculated against the current audio clock each time the
+				// global queue asks for a turn; using the start-time snapshot makes a
+				// long-lived iterator eventually look more than two seconds ahead and
+				// stop scheduling.
+				const currentTime = getAudioContextCurrentTimeMockedInTest();
 				const targetTime = getTargetTime(guessedNextTimestamp, currentTime);
 				if (targetTime === null) {
 					// Time will not be mounted
@@ -321,10 +383,18 @@ export const audioIteratorManager = ({
 					sequenceStartTime: getStartTime(),
 				});
 
-				return scheduledTime - getAudioContextCurrentTimeMockedInTest();
+				return scheduledTime - currentTime;
 			},
-			fn: () => iterator.getNextFn(),
+			fn: () => {
+				audioSchedulingTurnsStarted++;
+				lastAudioTurnStartedAtAudioTime =
+					sharedAudioContext.audioContext.currentTime;
+				return iterator.getNextFn();
+			},
 			onDone: (result, next) => {
+				audioSchedulingTurnsCompleted++;
+				lastAudioTurnCompletedAtAudioTime =
+					sharedAudioContext.audioContext.currentTime;
 				if (iterator.isDestroyed()) {
 					next();
 					onDestroyed();
@@ -341,18 +411,16 @@ export const audioIteratorManager = ({
 					return;
 				}
 
-				onScheduled(
-					result.value.sourceDurationInSeconds,
-					result.value.timelineTimestamp,
-				);
-				notifyNodeScheduled();
-
-				onAudioChunk({
+				const hasAudibleSlice = onAudioChunk({
 					buffer: result.value,
 					playbackRate,
 					scheduleAudioNode,
 					logLevel,
 				});
+				if (hasAudibleSlice) {
+					onScheduled(result.value);
+					notifyNodeScheduled();
+				}
 				proceedScheduling({
 					iterator,
 					nonce,
@@ -363,12 +431,14 @@ export const audioIteratorManager = ({
 					onDestroyed,
 					onDone,
 					logLevel,
-					currentTime,
 					getAudioContextCurrentTimeMockedInTest,
 				});
 				next();
 			},
 			onError: (e) => {
+				audioSchedulingTurnsCompleted++;
+				lastAudioTurnCompletedAtAudioTime =
+					sharedAudioContext.audioContext.currentTime;
 				if (e instanceof InputDisposedError) {
 					// iterator was disposed by a newer startAudioIterator call
 					// this is expected during rapid seeking
@@ -425,13 +495,21 @@ export const audioIteratorManager = ({
 		audioBufferIterator?.destroy();
 		unblockCurrentDelayHandle();
 
-		const delayHandle = delayPlaybackHandleIfNotPremounting();
+		const delayHandle = delayPlaybackHandleIfNotPremounting({
+			operation: 'audio-decode-iterator',
+			renderer: 'mediabunny-audio',
+			mediaType: 'audio',
+			reason: 'waiting-for-initial-audio-buffer',
+			requestedTimeInSeconds: startFromSecond,
+			unloopedTimeInSeconds: unloopedStartFromSecond,
+		});
 		currentDelayHandle = delayHandle;
 
 		currentAnchor = {
 			unloopedStartInSeconds: unloopedStartFromSecond,
 			mediaStartInSeconds: startFromSecond,
 		};
+		currentIteratorStartFromSecond = startFromSecond;
 
 		const maximumContinuousTimestamp =
 			startFromSecond + getSequenceDurationInSeconds() * playbackRate;
@@ -443,11 +521,18 @@ export const audioIteratorManager = ({
 					segmentEndInSeconds: maximumTimestamp,
 					maximumContinuousTimestamp,
 				})
-			: makeIteratorWithPriming({
-					audioSink,
-					timeToSeek: startFromSecond,
-					maximumTimestamp,
-				});
+			: audioSourceRanges !== undefined
+				? makeIteratorOverSourceRanges({
+						audioSink,
+						timeToSeek: startFromSecond,
+						maximumTimestamp,
+						sourceRanges: audioSourceRanges,
+					})
+				: makeIteratorWithPriming({
+						audioSink,
+						timeToSeek: startFromSecond,
+						maximumTimestamp,
+					});
 		const source = pitchShiftAudioIterator({
 			iterator: unshiftedSource,
 			toneFrequency: currentToneFrequency,
@@ -460,7 +545,9 @@ export const audioIteratorManager = ({
 		audioIteratorsCreated++;
 		audioBufferIterator = iterator;
 
-		let bufferedUntil = startFromSecond;
+		const startTimelineTime =
+			mapAudioSourceTimeToTimeline?.(startFromSecond) ?? startFromSecond;
+		let bufferedUntil = startTimelineTime;
 		let hasUnblockedPlayback = false;
 		const unblockPlayback = () => {
 			if (hasUnblockedPlayback) {
@@ -477,12 +564,17 @@ export const audioIteratorManager = ({
 			getTargetTime,
 			playbackRate,
 			scheduleAudioNode,
-			onScheduled: (sourceDurationInSeconds, timelineTimestamp) => {
-				bufferedUntil = Math.max(
-					bufferedUntil,
-					timelineTimestamp + sourceDurationInSeconds,
-				);
-				const bufferedDuration = bufferedUntil - startFromSecond;
+			onScheduled: (buffer) => {
+				const sourceEnd =
+					buffer.timelineTimestamp + buffer.sourceDurationInSeconds;
+				const mappedTimelineEnd = mapAudioSourceTimeToTimeline?.(sourceEnd);
+				const timelineEnd =
+					mappedTimelineEnd ??
+					(mapAudioSourceTimeToTimeline
+						? getSequenceDurationInSeconds()
+						: sourceEnd);
+				bufferedUntil = Math.max(bufferedUntil, timelineEnd);
+				const bufferedDuration = bufferedUntil - startTimelineTime;
 				// Need to schedule a bit into the future to unblock the buffer state,
 				// otherwise we might be scheduling too late. This must be based on
 				// timeline coverage, not audible duration or chunk count: silence is
@@ -500,7 +592,6 @@ export const audioIteratorManager = ({
 				unblockPlayback();
 			},
 			logLevel,
-			currentTime: sharedAudioContext.audioContext.currentTime,
 			getAudioContextCurrentTimeMockedInTest,
 		});
 	};
@@ -610,16 +701,22 @@ export const audioIteratorManager = ({
 			}
 
 			const currentIteratorTimestamp = audioBufferIterator.guessNextTimestamp();
+			const mappedTimeToCheck =
+				mapAudioSourceTimeToTimeline?.(timeToCheck) ?? timeToCheck;
+			const mappedIteratorTimestamp =
+				mapAudioSourceTimeToTimeline?.(currentIteratorTimestamp) ??
+				currentIteratorTimestamp;
+			const iteratorIsCloseBehind = mapAudioSourceTimeToTimeline
+				? mappedIteratorTimestamp <= mappedTimeToCheck &&
+					mappedTimeToCheck - mappedIteratorTimestamp < 1
+				: currentIteratorTimestamp < timeToCheck &&
+					Math.abs(currentIteratorTimestamp - timeToCheck) < 1;
 			const iteratorHasAdvancedThroughSilence =
 				loop &&
 				currentAnchor !== null &&
 				unloopedNewTime >= currentAnchor.unloopedStartInSeconds &&
 				currentIteratorTimestamp >= timeToCheck;
-			if (
-				iteratorHasAdvancedThroughSilence ||
-				(currentIteratorTimestamp < timeToCheck &&
-					Math.abs(currentIteratorTimestamp - timeToCheck) < 1)
-			) {
+			if (iteratorHasAdvancedThroughSilence || iteratorIsCloseBehind) {
 				processNext();
 				// The iterator has either advanced beyond the current time, meaning
 				// the gap is known silence, or is less than 1 second behind. Let it run.
@@ -650,6 +747,7 @@ export const audioIteratorManager = ({
 		destroyIterator: (stopAtTime?: number) => {
 			audioBufferIterator?.destroy(stopAtTime);
 			audioBufferIterator = null;
+			currentIteratorStartFromSecond = null;
 			// Drop the anchor together with the iterator it described, so
 			// getCurrentAnchor() cannot hand out a stale mapping (from a previous
 			// rate/trim) during the window before a new iterator is started.
@@ -660,6 +758,21 @@ export const audioIteratorManager = ({
 		seek,
 		getAudioIteratorsCreated: () => audioIteratorsCreated,
 		getTotalAudioScheduledInSeconds: () => totalAudioScheduledInSeconds,
+		getAudioChunksScheduled: () => audioChunksScheduled,
+		getAudioChunksRejected: () => audioChunksRejected,
+		getLastAudioChunkRejectionReason: () => lastAudioChunkRejectionReason,
+		getLastAudioChunkScheduledAtAudioTime: () =>
+			lastAudioChunkScheduledAtAudioTime,
+		getLastAudioChunkScheduledSourceTime: () =>
+			lastAudioChunkScheduledSourceTime,
+		getLastAudioChunkRejectedAtAudioTime: () =>
+			lastAudioChunkRejectedAtAudioTime,
+		getAudioSchedulingTurnsStarted: () => audioSchedulingTurnsStarted,
+		getAudioSchedulingTurnsCompleted: () => audioSchedulingTurnsCompleted,
+		getLastAudioTurnStartedAtAudioTime: () => lastAudioTurnStartedAtAudioTime,
+		getLastAudioTurnCompletedAtAudioTime: () =>
+			lastAudioTurnCompletedAtAudioTime,
+		getCurrentIteratorStartFromSecond: () => currentIteratorStartFromSecond,
 		setMuted: (newMuted: boolean) => {
 			muted = newMuted;
 			gainNode.gain.value = muted ? 0 : currentVolume;

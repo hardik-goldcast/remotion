@@ -362,13 +362,16 @@ export const AudioSchedulerPreview: React.FC<{
 				}
 			};
 
-			player.initialize(initialLocalTime, false, 1).then((result) => {
-				if (result.type !== 'success') {
-					handleInitializationFailure({result});
-				}
-			}, (error) => {
-				handleInitializationFailure({error});
-			});
+			player.initialize(initialLocalTime, false, 1).then(
+				(result) => {
+					if (result.type !== 'success') {
+						handleInitializationFailure({result});
+					}
+				},
+				(error) => {
+					handleInitializationFailure({error});
+				},
+			);
 
 			return slot;
 		};
@@ -377,6 +380,7 @@ export const AudioSchedulerPreview: React.FC<{
 			if (isDisposed.value) {
 				return;
 			}
+
 			disconnectRetiredSlots();
 
 			const entriesInWindow = new Set<string>();
@@ -421,9 +425,11 @@ export const AudioSchedulerPreview: React.FC<{
 			for (const slot of slots.values()) {
 				disposeSlot(slot, true);
 			}
+
 			for (const slot of retiredSlots.keys()) {
 				slot.gainNode.disconnect();
 			}
+
 			retiredSlots.clear();
 
 			slots.clear();

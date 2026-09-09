@@ -75,6 +75,7 @@ type VideoForPreviewProps = NativeVideoProps & {
 	readonly credentials: RequestCredentials | undefined;
 	readonly requestInit: MediaRequestInit | undefined;
 	readonly objectFit: VideoObjectFit;
+	readonly pauseWhenBuffering: boolean | undefined;
 	readonly setMediaDurationInSeconds: (durationInSeconds: number) => void;
 	readonly _experimentalInitiallyDrawCachedFrame: boolean;
 	readonly effects: EffectDefinitionAndStack<unknown>[];
@@ -82,6 +83,14 @@ type VideoForPreviewProps = NativeVideoProps & {
 };
 
 type VideoForPreviewAssertedShowingProps = VideoForPreviewProps;
+
+// When pauseWhenBuffering is explicitly false, video readiness is best-effort:
+// the player can decode and paint whenever it can without acquiring a shared
+// Remotion buffering block. The normal preview path passes true for visual
+// video, so it participates in two-way buffering.
+const NO_OP_VIDEO_BUFFER_STATE = {
+	delayPlayback: () => ({unblock: () => undefined}),
+};
 
 const VideoForPreviewAssertedShowing: React.FC<
 	VideoForPreviewAssertedShowingProps
@@ -106,6 +115,7 @@ const VideoForPreviewAssertedShowing: React.FC<
 	audioStreamIndex,
 	debugOverlay,
 	headless,
+	pauseWhenBuffering,
 	onError,
 	credentials,
 	requestInit,
@@ -195,8 +205,6 @@ const VideoForPreviewAssertedShowing: React.FC<
 
 	const isPlayerBuffering = useBuffering();
 	const initialPlaying = useRef(playing && !isPlayerBuffering);
-	const initialIsPremounting = useRef(isPremounting);
-	const initialIsPostmounting = useRef(isPostmounting);
 	const initialGlobalPlaybackRate = useRef(globalPlaybackRate);
 	const initialPlaybackRate = useRef(playbackRate);
 	const initialToneFrequency = useRef(toneFrequency);
@@ -207,6 +215,8 @@ const VideoForPreviewAssertedShowing: React.FC<
 	const hasDrawnRealFrameRef = useRef(false);
 	const isPremountingRef = useRef(isPremounting);
 	isPremountingRef.current = isPremounting;
+	const isPostmountingRef = useRef(isPostmounting);
+	isPostmountingRef.current = isPostmounting;
 
 	useLayoutEffect(() => {
 		if (!_experimentalInitiallyDrawCachedFrame) {
@@ -281,9 +291,15 @@ const VideoForPreviewAssertedShowing: React.FC<
 				toneFrequency: initialToneFrequency.current,
 				audioStreamIndex,
 				debugOverlay,
-				bufferState: buffer,
-				isPremounting: initialIsPremounting.current,
-				isPostmounting: initialIsPostmounting.current,
+				bufferState:
+					pauseWhenBuffering === false
+						? NO_OP_VIDEO_BUFFER_STATE
+						: buffer,
+				// This effect can rerun when the source/preload changes while the
+				// component remains mounted. Read the current Sequence lifecycle
+				// state instead of the flags from the component's first render.
+				isPremounting: isPremountingRef.current,
+				isPostmounting: isPostmountingRef.current,
 				globalPlaybackRate: initialGlobalPlaybackRate.current,
 				durationInFrames: initialSequenceDuration.current,
 				onVideoFrameCallback: initialOnVideoFrameRef.current ?? null,
@@ -292,7 +308,8 @@ const VideoForPreviewAssertedShowing: React.FC<
 				credentials,
 				requestInit: initialRequestInit,
 				tagType: 'video',
-				requireCanvasForVideo: !headless,
+				bufferingLabel: 'VideoForPreview',
+				requireCanvasForVideo: !headless && pauseWhenBuffering !== false,
 				getEffects: () => effectsRef.current,
 				getEffectChainState: (width, height) =>
 					effectChainStateRef.current?.get(width, height)!,
@@ -449,6 +466,7 @@ const VideoForPreviewAssertedShowing: React.FC<
 		videoConfig.fps,
 		credentials,
 		initialRequestInit,
+		pauseWhenBuffering,
 		setMediaDurationInSeconds,
 	]);
 

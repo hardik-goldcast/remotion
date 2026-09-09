@@ -1,4 +1,7 @@
-import type {NormalizedAudioScheduleEntry} from './audio-scheduler-types';
+import type {
+	NormalizedAudioFeedPlan,
+	NormalizedAudioScheduleEntry,
+} from './audio-scheduler-types';
 
 const clamp = (value: number, min: number, max: number) =>
 	Math.min(max, Math.max(min, value));
@@ -125,5 +128,73 @@ export const scheduleAudioScheduleEntryGain = ({
 		gain.linearRampToValueAtTime(0, audioEndTime);
 	} else {
 		gain.setValueAtTime(0, audioEndTime);
+	}
+};
+
+export const scheduleAudioFeedPlanGain = ({
+	gainNode,
+	plan,
+	schedulerStartTimeInSeconds,
+	audioSyncAnchor,
+	audioContextCurrentTime,
+}: {
+	gainNode: GainNode;
+	plan: NormalizedAudioFeedPlan;
+	schedulerStartTimeInSeconds: number;
+	audioSyncAnchor: {readonly value: number};
+	audioContextCurrentTime: number;
+}) => {
+	const now = audioContextCurrentTime;
+	const {gain} = gainNode;
+
+	gain.cancelScheduledValues(now);
+	gain.setValueAtTime(0, now);
+
+	for (const range of plan.ranges) {
+		const audioStartTime =
+			audioSyncAnchor.value +
+			schedulerStartTimeInSeconds +
+			range.startTimeInSeconds;
+		const audioEndTime = audioStartTime + range.durationInSeconds;
+
+		if (audioEndTime <= now) {
+			continue;
+		}
+
+		const audibleStartTime = Math.max(now, audioStartTime);
+		const remainingDuration = audioEndTime - audibleStartTime;
+		const fadeInDuration = Math.min(
+			range.fadeInDurationInSeconds,
+			remainingDuration / 2,
+		);
+		const fadeOutDuration = Math.min(
+			range.fadeOutDurationInSeconds,
+			remainingDuration / 2,
+		);
+		const fadeInEndTime = audibleStartTime + fadeInDuration;
+		const fadeOutStartTime = audioEndTime - fadeOutDuration;
+
+		if (audibleStartTime > now) {
+			// This also creates silence for any composition-time gap between two
+			// ranges. Source gaps within a feed do not create an event here because
+			// their composition ranges are intentionally adjacent.
+			gain.setValueAtTime(0, audibleStartTime);
+		}
+
+		if (fadeInDuration > 0) {
+			gain.linearRampToValueAtTime(range.volume, fadeInEndTime);
+		} else {
+			gain.setValueAtTime(range.volume, audibleStartTime);
+		}
+
+		if (fadeOutDuration > 0) {
+			if (fadeOutStartTime > fadeInEndTime) {
+				gain.setValueAtTime(range.volume, fadeOutStartTime);
+			}
+
+			gain.linearRampToValueAtTime(0, audioEndTime);
+		} else {
+			gain.setValueAtTime(0, audioEndTime);
+		}
 	}
 };

@@ -57,6 +57,7 @@ export const useCommonEffects = ({
 		const mediaPlayer = mediaPlayerRef.current;
 		if (!mediaPlayer) return;
 
+		mediaPlayer.setPlaybackIntent(playing);
 		if (playing && !isPlayerBuffering) {
 			mediaPlayer.play();
 		} else {
@@ -178,17 +179,8 @@ export const useCommonEffects = ({
 			return;
 		}
 
-		mediaPlayer.setIsPremounting(isPremounting);
-	}, [isPremounting, mediaPlayerReady, mediaPlayerRef]);
-
-	useLayoutEffect(() => {
-		const mediaPlayer = mediaPlayerRef.current;
-		if (!mediaPlayer) {
-			return;
-		}
-
-		mediaPlayer.setIsPostmounting(isPostmounting);
-	}, [isPostmounting, mediaPlayerReady, mediaPlayerRef]);
+		mediaPlayer.setPremountingState(isPremounting, isPostmounting);
+	}, [isPremounting, isPostmounting, mediaPlayerReady, mediaPlayerRef]);
 
 	useLayoutEffect(() => {
 		const mediaPlayer = mediaPlayerRef.current;
